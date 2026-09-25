@@ -1,0 +1,5 @@
+PyQt6>=6.4.0
+# optional: without it 4 of the 16 audit sections (CPU & Memory, Disk,
+# Network, Running Processes) report "warn". The other 12 sections, the
+# CLI and the JSON contract run on the standard library alone.
+psutil>=5.9.0
