@@ -699,7 +699,39 @@ class AuditEngine:
                 out = cmd(["ss", "-tlnp"], timeout=8)
                 if not out or "[not found]" in out:
                     out = cmd(["netstat", "-tlnp"], timeout=8)
+            # A port is only "open" off-host if it is bound to a non-loopback
+            # address, and that is independent of how innocuous the number
+            # looks — a container publishing 0.0.0.0:4007 is reachable from the
+            # LAN however arbitrary 4007 is. ss and netstat both put the local
+            # address in field 4 of a LISTEN row, so one parser covers both.
+            #
+            # A handful of services are *expected* to bind LAN-wide on a
+            # desktop; reporting those would make the section warn on every
+            # machine, and a check that always warns is a check nobody reads.
+            # They are listed in the output but do not drive the status.
+            EXPECTED_LAN = {"22", "53", "139", "445", "631", "5353"}
+            lan, unexpected = [], []
+            for line in (out or "").splitlines():
+                if "LISTEN" not in line:
+                    continue
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                host, _, port = parts[3].rpartition(":")
+                if not host or not port.isdigit():
+                    continue
+                if host.startswith("127.") or host in ("[::1]", "::1", "localhost"):
+                    continue  # loopback-only: not reachable off-host
+                lan.append(f"{parts[3]:<26} {parts[-1]}")
+                if port not in EXPECTED_LAN:
+                    unexpected.append(f"{parts[3]:<26} {parts[-1]}")
+
             status = "warn" if any(p in out for p in suspicious) else "ok"
+            if unexpected:
+                status = "warn"
+            if lan and not _probe_failed(out):
+                out = (out or "").rstrip() + "\n\nNon-loopback listeners " \
+                    "(reachable off-host):\n  " + "\n  ".join(lan)
             return status, out or "No open ports found"
 
         # ── Running Processes (psutil — all platforms) ────────
@@ -776,14 +808,106 @@ class AuditEngine:
                 return "ok", out or "pf rules empty or permission denied"
 
             else:  # Linux
-                ufw = cmd(["ufw", "status", "verbose"], timeout=8)
-                if "inactive" in ufw.lower() or not ufw or "[not found]" in ufw or "[error" in ufw:
-                    iptables = cmd(["iptables", "-L", "-n", "--line-numbers"], timeout=8)
-                    if iptables:
-                        iptables = "\n".join(iptables.splitlines()[:30])
-                    status = "warn" if ufw and "inactive" in ufw.lower() else "ok"
-                    return status, (ufw + "\n\niptables:\n" + iptables).strip()
-                return "ok", ufw
+                # `ufw status` needs root. Unprivileged it prints "ERROR: You
+                # need to be root to run this script" and exits non-zero — so
+                # the failure arrives as ordinary-looking text, NOT as a
+                # _CMD_FAILED sentinel, and the old "[error" test never matched
+                # it. The result was a section reporting ok while its own
+                # output was an error message.
+                #
+                # Try the non-prompting sudo path first (the fail2ban and
+                # AppArmor probes use the same idiom), then fall back to the
+                # config files, which are world-readable and carry the
+                # authoritative ENABLED / DEFAULT_*_POLICY keys. Only if all of
+                # that fails is the section "error" — never "ok".
+                ufw = cmd(["sudo", "-n", "ufw", "status", "verbose"], timeout=8)
+                if ("need to be root" in ufw.lower()
+                        or "password is required" in ufw.lower()
+                        or _probe_failed(ufw)):
+                    ufw = ""
+
+                policies = {}
+                for conf in ("/etc/ufw/ufw.conf", "/etc/default/ufw"):
+                    try:
+                        with open(conf, encoding="utf-8", errors="replace") as fh:
+                            body = fh.read()
+                    except OSError:
+                        continue
+                    for key, val in re.findall(
+                        r"^\s*(ENABLED|DEFAULT_INPUT_POLICY|DEFAULT_FORWARD_POLICY"
+                        r"|DEFAULT_OUTPUT_POLICY)\s*=\s*\"?([A-Za-z]+)",
+                        body, re.M,
+                    ):
+                        policies[key] = val.upper()
+
+                # Docker creates its own FORWARD/DOCKER-USER chains ahead of
+                # ufw's, so a published container port stays reachable even
+                # with DEFAULT_INPUT_POLICY=DROP and no matching ufw profile.
+                # ufw being "on" says nothing about it; read the publishes.
+                exposed, docker_note = [], ""
+                if shutil.which("docker"):
+                    ps = cmd(["docker", "ps", "--format",
+                              "{{.Names}}\t{{.Ports}}"], timeout=10)
+                    if not _probe_failed(ps):
+                        for line in ps.splitlines():
+                            if "->" not in line:
+                                continue
+                            # The leading-context alternative must include
+                            # whitespace, not just ",". docker ps emits
+                            # "<name>\t<ports>", so the FIRST publish in a field
+                            # is preceded by a tab, not a comma — and a bare
+                            # IPv4 publish ("127.0.0.1:4007->5000/tcp") starts a
+                            # token with nothing before it. Matching only ","
+                            # made this blind to exactly the IPv4 exposures it
+                            # exists to find (it looked fine only because docker
+                            # rewrites 0.0.0.0 publishes to [::]).
+                            pubs = re.findall(
+                                r"(?:^|[\s,])(\[?[\w:.]*?\]?):(\d+)->", line)
+                            hosts = [h for h, _ in pubs]
+                            if any(h not in ("127.0.0.1", "[::1]", "::1")
+                                   for h in hosts):
+                                exposed.append(line.split("\t")[0])
+                        if exposed:
+                            docker_note = (
+                                "\n\nDocker publishes bypass ufw (its FORWARD/"
+                                "DOCKER-USER rules run first). Reachable off-host:"
+                                + "".join(f"\n  - {name}" for name in exposed))
+
+                enabled = policies.get("ENABLED")
+                in_pol = policies.get("DEFAULT_INPUT_POLICY")
+
+                if ufw:
+                    status = "warn" if "inactive" in ufw.lower() else "ok"
+                    detail = ufw
+                elif enabled is None:
+                    # An unparseable probe is absence of evidence, not a finding
+                    # (the same rule rex applies to a failed LAN-listen probe).
+                    # Returning the neutral "info" status keeps a host with no
+                    # ufw installed from turning the whole audit into an error; a
+                    # genuine unexpected exception is still caught upstream by
+                    # _run_safe() and reported as "error".
+                    return "info", (
+                        "Could not determine firewall state: `ufw status` needs "
+                        "root (tried sudo -n) and /etc/ufw/*.conf were unreadable "
+                        "(ufw may not be installed).")
+                else:
+                    detail = "\n".join([
+                        f"ENABLED               : {enabled}",
+                        f"DEFAULT_INPUT_POLICY  : {in_pol or '?'}",
+                        f"DEFAULT_FORWARD_POLICY: {policies.get('DEFAULT_FORWARD_POLICY', '?')}",
+                        "(from /etc/ufw/ufw.conf + /etc/default/ufw — per-rule "
+                        "detail and `iptables -L` need root)",
+                    ])
+                    if enabled != "YES":
+                        status = "warn"
+                    elif in_pol in ("DROP", "REJECT"):
+                        status = "ok"
+                    else:
+                        status = "warn"
+
+                if exposed:
+                    status = "warn"
+                return status, (detail + docker_note).strip()
 
         # ── Intrusion Prevention (fail2ban) ───────────────────
         elif section == "Intrusion Prevention (fail2ban)":
