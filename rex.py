@@ -120,7 +120,7 @@ IS_LINUX = _OS == "Linux"
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.6.0"
+VERSION  = "1.6.1"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -836,7 +836,7 @@ class AuditEngine:
                     for key, val in re.findall(
                         r"^\s*(ENABLED|DEFAULT_INPUT_POLICY|DEFAULT_FORWARD_POLICY"
                         r"|DEFAULT_OUTPUT_POLICY)\s*=\s*\"?([A-Za-z]+)",
-                        body, re.M,
+                        body, re.MULTILINE,
                     ):
                         policies[key] = val.upper()
 
@@ -895,8 +895,8 @@ class AuditEngine:
                         f"ENABLED               : {enabled}",
                         f"DEFAULT_INPUT_POLICY  : {in_pol or '?'}",
                         f"DEFAULT_FORWARD_POLICY: {policies.get('DEFAULT_FORWARD_POLICY', '?')}",
-                        "(from /etc/ufw/ufw.conf + /etc/default/ufw — per-rule "
-                        "detail and `iptables -L` need root)",
+                        ("(from /etc/ufw/ufw.conf + /etc/default/ufw — per-rule "
+                         "detail and `iptables -L` need root)"),
                     ])
                     if enabled != "YES":
                         status = "warn"
