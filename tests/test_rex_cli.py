@@ -449,8 +449,172 @@ def test_deepseek_missing_key_reports_401():
     assert text == "" and "401" in err
 
 
+# --------------------------------------------------------------------------
+# the accountless lane: no key, no account, nothing to identify anyone with
+# --------------------------------------------------------------------------
+class _FakePollinations(BaseHTTPRequestHandler):
+    """Records every header it is sent, so "no credential" is testable.
+
+    A test that only asserts a 200 came back would pass just as happily if the
+    lane quietly forwarded an API key; recording the headers is what makes the
+    anonymity claim falsifiable.
+    """
+
+    status = 200
+    seen = []
+    last_body = {}
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        type(self).seen.append({k.lower(): v for k, v in self.headers.items()})
+        type(self).last_body = json.loads(body or b"{}")
+        if type(self).status != 200:
+            self.send_response(type(self).status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"shared tier busy"}')
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "chmod 600 ~/.ssh/id_rsa\nsystemctl restart ssh",
+                # The shared tier answers with its chain-of-thought inline.
+                "reasoning": "HIDDEN_CHAIN_OF_THOUGHT rm -rf /",
+            },
+            "finish_reason": "stop",
+        }]}).encode())
+
+
+@pytest.fixture
+def fake_pollinations():
+    _FakePollinations.seen = []
+    _FakePollinations.status = 200
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakePollinations)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/openai", _FakePollinations
+    server.shutdown()
+    server.server_close()
+
+
+def test_pollinations_lane_sends_no_credential_anywhere(fake_pollinations, monkeypatch):
+    """The point of the lane: it works with every credential in the environment
+    and still sends none of them. A key in the env must not be forwarded, or
+    "anonymous" would be a UI label rather than a property of the wire."""
+    url, handler = fake_pollinations
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "SECRET-ANTHROPIC")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "SECRET-DEEPSEEK")
+    monkeypatch.setenv("AEGIS_KEY", "SECRET-AEGIS")
+
+    cfg = rexmod.load_provider_config("pollinations", pollinations_url=url)
+    text, err = rexmod.provider_stream("pollinations", "prompt", cfg)
+
+    assert err is None, err
+    assert handler.seen, "the lane never reached the endpoint"
+    headers = handler.seen[0]
+    for banned in ("authorization", "x-api-key", "x-aegis-key", "x-provider-key", "cookie"):
+        assert banned not in headers, f"{banned} was sent on the anonymous lane"
+    assert "SECRET" not in json.dumps(headers)
+    # The request body must not smuggle a credential either.
+    assert "SECRET" not in json.dumps(handler.last_body)
+    assert handler.last_body["model"] == rexmod.POLLINATIONS_MODEL
+
+
+def test_pollinations_reasoning_never_reaches_commands(fake_pollinations):
+    url, _handler = fake_pollinations
+    text, err = rexmod.provider_stream(
+        "pollinations", "prompt", {"pollinations_url": url})
+    assert err is None
+    assert "HIDDEN_CHAIN_OF_THOUGHT" not in text
+    assert rexmod.clean_commands(text) == ["chmod 600 ~/.ssh/id_rsa",
+                                           "systemctl restart ssh"]
+
+
+def test_pollinations_empty_content_is_an_error_not_a_command(fake_pollinations):
+    url, handler = fake_pollinations
+    original = handler.do_POST
+
+    def empty_content(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"choices": [
+            {"message": {"content": "", "reasoning": "spent it all thinking"}}]}).encode())
+
+    handler.do_POST = empty_content
+    try:
+        text, err = rexmod.provider_stream(
+            "pollinations", "p", {"pollinations_url": url})
+    finally:
+        handler.do_POST = original
+    assert text == ""
+    assert err and "no content" in err
+
+
+def test_pollinations_rate_limit_reads_as_busy_not_as_missing_key(fake_pollinations):
+    """A shared tier 429s. That must not be reported as a credential problem —
+    there is no credential to fix, and telling an agent to go and configure one
+    would send it looking for a key that does not exist."""
+    url, handler = fake_pollinations
+    handler.status = 429
+    text, err = rexmod.provider_stream(
+        "pollinations", "p", {"pollinations_url": url})
+    assert text == ""
+    assert "busy" in err and "429" in err
+    assert "key" not in err.lower()
+
+
+def test_capabilities_publishes_the_anonymity_contract():
+    """The machine-readable half of "total anonymous": an agent must be able to
+    check it instead of inferring it from --help prose."""
+    _p, cap = run_json("--capabilities")
+    anon = cap["anonymity"]
+    assert anon["account_required"] is False
+    assert anon["api_key_required"] is False
+    assert anon["install_id"] is None
+    assert anon["telemetry"] is False
+    assert anon["calls_home"] == []
+    assert "pollinations" in anon["keyless_providers"]
+    assert anon["local_providers"] == ["ollama"]
+
+    prov = cap["providers"]["pollinations"]
+    assert prov["api_key_required"] is False
+    assert prov["account_required"] is False
+    assert prov["env"] == []
+    # Honest about the trade: accountless is not the same as private.
+    assert prov["leaves_machine"] is True
+    assert cap["providers"]["ollama"]["leaves_machine"] is False
+    assert cap["providers"]["claude"]["api_key_required"] is True
+    assert "pollinations" in rexmod.PROVIDER_IDS
+    assert rexmod.PROVIDER_IDS[0] == "ollama"
+
+
+def test_gui_combo_index_matches_provider_ids():
+    """The dialog resolves the provider by combo index (PROVIDER_IDS[index]),
+    so a provider added to one list and not the other silently selects the
+    wrong lane — the exact class of bug the ordering comment warns about."""
+    src = (ROOT / "rex.py").read_text(encoding="utf-8")
+    combo = re.search(r"self\.provider_combo\.addItems\(\[(.*?)\]\)", src, re.S)
+    assert combo, "the provider combo is no longer a literal addItems call"
+    labels = [x.strip().strip('"') for x in combo.group(1).split(",") if x.strip()]
+    assert len(labels) == len(rexmod.PROVIDER_IDS), (
+        "GUI combo and PROVIDER_IDS have drifted: "
+        f"{labels} vs {rexmod.PROVIDER_IDS}")
+
+
 def test_cli_fix_print_prompt_never_calls_the_provider():
-    p, payload = run_json("--fix", "ssh-config", "--print-prompt", "--json")
+    # --force: this host's ssh-config verdict is "ok", and --fix refuses to
+    # prompt on a non-finding by default (TestNoFixForANonFinding). This test
+    # is about the prompt bytes, so it opts in explicitly.
+    p, payload = run_json("--fix", "ssh-config", "--print-prompt", "--json",
+                          "--force")
     assert p.returncode == 0, p.stderr
     assert payload["schema"] == "aegis.rex.fix/1"
     assert payload["section_id"] == "ssh-config"
@@ -473,7 +637,7 @@ def test_cli_fix_dry_run_apply_does_not_execute(fake_deepseek, tmp_path):
         "ai_provider": "deepseek", "deepseek_url": url,
         "deepseek_api_key": "k", "deepseek_model": "deepseek-flash"}))
     p, payload = run_json("--fix", "ssh-config", "--apply", "--json",
-                          env={"HOME": str(home)})
+                          "--force", env={"HOME": str(home)})
     assert p.returncode == 0, p.stderr
     assert payload["schema"] == "aegis.rex.fix/1"
     # the plan was fetched from the provider ...
@@ -507,10 +671,12 @@ class TestSecretDetection:
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
     }
 
+    # Shapes only — never a value that exists anywhere else. Two entries here
+    # used to be *live* credentials (see TestNoCredentialLiteralsInRepo).
     REAL = {
-        "OPENAI_API_KEY": "sk-proj-5BeG1e73THilBsxt2HvUUUxJWCA1dgO_CzK8wv",
-        "STRIPE_WEBHOOK_SECRET": "whsec_J29lBAe0OZjQILlc1JIIVcKiWjUqfvnL",
-        "AEGIS_MEMORY_TOKEN": "8XpVE9A3xqItuapAm23SfFSd1TwWbzQtNMoTj8qSZUA",
+        "OPENAI_API_KEY": "sk-proj-EXAMPLE-fake-value-000000000000",
+        "STRIPE_WEBHOOK_SECRET": "whsec_ExampleFakeValue000000000000000000",
+        "AEGIS_MEMORY_TOKEN": "Fake-Example-Token-000000000000000000000",
         "MYSQL_PWD": "hunter2-but-long-enough-to-matter",
         "MY_AUTH": "some-credential-value",
         "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -534,9 +700,365 @@ class TestSecretDetection:
     def test_section_excludes_paths_and_reports_real_ones(self):
         engine = rexmod.AuditEngine()
         status, out = engine._run_section("Environment Secrets")
-        assert status in ("ok", "warn")
+        # "info" is the verdict when the credentials present are all defined in
+        # an owner-only file: visible, uncharged. See TestEnvSecretProvenance.
+        assert status in ("ok", "warn", "info")
         for name in ("PWD =", "OLDPWD =", "XAUTHORITY =", "SSH_AUTH_SOCK ="):
             assert name not in out, f"{name} wrongly reported as a secret"
+
+
+class TestNoCredentialLiteralsInRepo:
+    """A detector fixture must never be a real credential.
+
+    History (2026-09-30): this file shipped the *live* STRIPE_WEBHOOK_SECRET
+    and AEGIS_MEMORY_TOKEN as the values the secret rules were tested against,
+    and the file was mirrored into the public repo aegiscloud-devs/aegiscloud,
+    where raw.githubusercontent.com served it anonymously with HTTP 200. The
+    rules only need the shape of a credential, so a synthetic value tests
+    exactly as much and leaks nothing if it escapes.
+
+    This test is the regression guard: no literal in the repo may match a
+    credential value rule unless it is listed here as synthetic.
+    """
+
+    # Values that are deliberately fake. Anything matching a credential rule
+    # and NOT listed here fails the suite.
+    SYNTHETIC = frozenset({
+        "sk-proj-EXAMPLE-fake-value-000000000000",
+        "whsec_ExampleFakeValue000000000000000000",
+        "Fake-Example-Token-000000000000000000000",
+        # Deliberately fake values used to exercise the masking path.
+        "sk-EXAMPLE-mask-value-0000000000",
+        "sk-EXAMPLE-other-value-111111111",
+        # The example key from the AWS documentation, not an account's key.
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    })
+
+    SCANNABLE = ("rex.py", "README.md", "tests/test_rex_cli.py")
+
+    @staticmethod
+    def credential_literals(text):
+        """String literals in `text` that look like credential material.
+
+        Same value rule the audit uses, including its path exclusion — a long
+        /org/freedesktop/... path is not credential-shaped and must not be
+        reported here either.
+        """
+        hits = set()
+        for a, b in re.findall(r'"([^"\n]{20,})"|\'([^\'\n]{20,})\'', text):
+            lit = a or b
+            if rexmod._SECRET_VALUE.match(lit) and not rexmod._looks_like_path(lit):
+                hits.add(lit)
+        return hits
+
+    def test_scanner_can_fail(self):
+        """Negative control: the guard is worthless if it cannot report."""
+        planted = "whsec_ExampleFakeValue000000000000000000"
+        probe = 'x = "sk-proj-EXAMPLE-fake-value-000000000000"\n'
+        self.assert_flagged(probe)
+        # ...and the allowlisted literal is reported by the scan itself, which
+        # is why the allowlist exists rather than a "no hits" assertion.
+        assert planted in self.credential_literals(f'k = "{planted}"')
+
+    @staticmethod
+    def assert_flagged(text):
+        hits = TestNoCredentialLiteralsInRepo.credential_literals(text)
+        assert hits, "the scanner failed to flag a credential-shaped literal"
+
+    def test_repo_holds_only_synthetic_credentials(self):
+        offenders = {}
+        for rel in self.SCANNABLE:
+            path = ROOT / rel
+            if not path.exists():
+                continue
+            found = self.credential_literals(
+                path.read_text(errors="replace")) - self.SYNTHETIC
+            if found:
+                offenders[rel] = sorted(found)
+        assert not offenders, (
+            "credential-shaped literal(s) that are not declared synthetic: "
+            f"{offenders} — replace with a fake value of the same shape "
+            "(repo history has been mirrored to a public remote)")
+
+
+class TestNoFixForANonFinding:
+    """`--fix` must not invent remediation for a section that is not a finding.
+
+    Measured: after the sudo and env-secret sections stopped reporting false
+    positives, `rex.py --fix sudo-privileges --print-prompt` still emitted a
+    full hardening prompt ("fix this specific finding") for a host whose audit
+    said `info`. The model cannot answer "there is nothing to fix" — handed
+    that prompt it returns plausible commands for a defect that does not
+    exist, which is the same false-positive leaving the tool in the other
+    direction.
+    """
+
+    def test_clean_section_never_reaches_a_provider(self):
+        p, payload = run_json("--fix", "sudo-privileges", "--json")
+        assert p.returncode == 0, p.stderr
+        assert payload["no_finding"] is True
+        assert payload["status"] == "info", payload["status"]
+        assert payload["provider"] is None
+        assert payload["prompt"] is None, "a prompt was built for a clean section"
+        assert payload["commands"] == []
+        assert payload["applied"] is False
+
+    def test_clean_section_error_is_not_reported_as_a_provider_failure(self):
+        """Exit 0, empty command list — a refusal is not a broken provider."""
+        p, payload = run_json("--fix", "sudo-privileges", "--json")
+        assert payload["error"] is None
+        assert p.stdout.strip(), "the refusal must be announced, not silent"
+
+    def test_human_output_names_the_verdict(self):
+        p = subprocess.run([PY, str(REX), "--fix", "sudo-privileges"],
+                           capture_output=True, text=True, timeout=60,
+                           check=False)
+        assert p.returncode == 0, p.stderr
+        blob = p.stdout + p.stderr
+        assert "nothing to remediate" in blob
+        assert "no provider was contacted" in blob
+
+    def test_negative_control_the_gate_is_what_refused(self):
+        """Same command, one flag apart: --force gets past the gate.
+
+        Without this, "no prompt was built" could just as well mean the
+        section was broken. With it, the refusal is attributable to the gate.
+        """
+        p, payload = run_json("--fix", "ssh-config", "--print-prompt", "--json",
+                              "--force")
+        assert p.returncode == 0, p.stderr
+        assert payload.get("no_finding") is not True
+        assert payload["prompt"], "a real finding produced no prompt"
+        assert "SSH Config" in payload["prompt"]
+
+
+class TestSudoProbeHonesty:
+    """A password-gated sudo must not be published as a fixable defect.
+
+    Observed on a real host: `sudo -l` blocked on a password prompt that an
+    audit tool can never answer, the failure came back as
+    ("Could not retrieve sudo rules"), the section scored warn/medium/fixable,
+    and rex then offered the model a "remediation" for a host that was merely
+    password-gated. Absence of evidence is not a finding.
+    """
+
+    def _run(self, monkeypatch, out):
+        seen = {}
+
+        def fake_cmd(args, timeout=10):
+            seen["argv"] = list(args) if not isinstance(args, str) else args
+            return out
+
+        monkeypatch.setattr(rexmod.AuditEngine, "_cmd", staticmethod(fake_cmd))
+        status, text = rexmod.AuditEngine()._run_section("Sudo / Privileges")
+        return status, text, seen
+
+    def test_probe_never_can_prompt(self, monkeypatch):
+        """-n is the whole safety property: without it sudo blocks on a TTY."""
+        _, _, seen = self._run(monkeypatch, "sudo: a password is required")
+        assert seen["argv"] == ["sudo", "-n", "-l"], seen["argv"]
+
+    def test_password_prompt_is_unassessed_not_a_finding(self, monkeypatch):
+        status, text, _ = self._run(
+            monkeypatch, "sudo: a password is required")
+        assert status == "info", f"password-gated sudo scored as {status!r}"
+        assert status not in rexmod.FIXABLE_STATUSES
+        assert "UNVERIFIED" in text
+        # and it must not be dressed up as a pass either
+        assert status != "ok"
+
+    def test_no_password_available_is_also_unassessed(self, monkeypatch):
+        status, _, _ = self._run(
+            monkeypatch, "sudo: no tty present and no askpass program specified")
+        assert status == "info"
+
+    def test_probe_failure_sentinel_is_unassessed(self, monkeypatch):
+        status, _, _ = self._run(monkeypatch, "[not found]")
+        assert status == "info"
+
+    def test_real_sudo_rules_still_detected(self, monkeypatch):
+        """The honest branches must not swallow the real finding."""
+        status, text, _ = self._run(
+            monkeypatch, "User neo may run the following commands:\n"
+                         "    (ALL) NOPASSWD: ALL")
+        assert status == "warn"
+        assert "NOPASSWD" in text
+
+    def test_passwordless_host_without_nopasswd_is_clean(self, monkeypatch):
+        status, _, _ = self._run(
+            monkeypatch,
+            "User neo may run the following commands:\n"
+            "    (ALL : ALL) ALL")
+        assert status == "ok"
+
+    def test_packaged_helper_grant_is_not_a_defect(self, monkeypatch):
+        """A stock Linux Mint rule set: four root-owned helper scripts.
+
+        These are the entries this very host carries. They were published as a
+        medium-severity fixable defect, which told the model to "fix" the
+        distribution's own update helpers.
+        """
+        status, text, _ = self._run(
+            monkeypatch,
+            "Matching Defaults entries for neo on neo:\n"
+            "    env_reset, use_pty\n\n"
+            "User neo may run the following commands on neo:\n"
+            "    (ALL : ALL) ALL\n"
+            "    (root) NOPASSWD: /bin/true\n")
+        assert status == "info", f"a packaged helper scored {status!r}"
+        assert "fixed, root-owned" in text
+
+    def test_shell_target_is_still_a_finding(self, monkeypatch):
+        status, text, _ = self._run(
+            monkeypatch, "    (root) NOPASSWD: /bin/bash")
+        assert status == "warn"
+        assert "root on demand" in text
+
+    def test_wildcard_target_is_still_a_finding(self, monkeypatch):
+        status, _, _ = self._run(
+            monkeypatch, "    (root) NOPASSWD: /usr/bin/*")
+        assert status == "warn"
+
+    def test_writable_or_unowned_target_is_a_finding(self, monkeypatch, tmp_path):
+        loose = tmp_path / "helper.sh"
+        loose.write_text("#!/bin/sh\n")
+        loose.chmod(0o777)
+        status, text, _ = self._run(
+            monkeypatch, f"    (root) NOPASSWD: {loose}")
+        assert status == "warn"
+        assert "writable" in text
+
+    def test_grant_pointing_at_nothing_is_a_finding(self, monkeypatch):
+        status, text, _ = self._run(
+            monkeypatch, "    (root) NOPASSWD: /usr/bin/does-not-exist-rex")
+        assert status == "warn"
+        assert "does not exist" in text
+
+    def test_grant_classifier_distinguishes_targets(self):
+        """Negative control: the verdict tracks the target, not the keyword."""
+        verdicts = {
+            spec: rexmod.classify_sudo_grant(spec)[0]
+            for spec in ("/bin/true", "/bin/bash", "ALL", "/usr/bin/*",
+                         "!/bin/false", "/usr/bin/does-not-exist-rex")
+        }
+        assert verdicts == {
+            "/bin/true": "ok",
+            "/bin/bash": "warn",
+            "ALL": "warn",
+            "/usr/bin/*": "warn",
+            "!/bin/false": "ok",
+            "/usr/bin/does-not-exist-rex": "warn",
+        }, verdicts
+
+    def test_negative_control_the_verdict_tracks_the_probe(self, monkeypatch):
+        """Same host, different probe output -> different verdict.
+
+        This is what makes the assertions above evidence rather than
+        decoration: if the section ignored its input, every assertion here
+        would collapse onto one status.
+        """
+        verdicts = {out: self._run(monkeypatch, out)[0] for out in (
+            "sudo: a password is required",
+            "User neo may run the following commands:\n    (ALL) NOPASSWD: ALL",
+            "User neo may run the following commands:\n    (ALL : ALL) ALL",
+        )}
+        assert len(set(verdicts.values())) == 3, verdicts
+        assert verdicts["sudo: a password is required"] == "info"
+
+
+# --------------------------------------------------------------------------
+# environment secrets: a key in the env is only a finding when nothing
+# owner-only defines it
+# --------------------------------------------------------------------------
+class TestEnvSecretProvenance:
+    """The section must classify, not just count.
+
+    Before 1.6.4 every credential in the process environment was one warning,
+    which charged the score for a host whose keys all come from a mode-0600
+    file the user created on purpose. The finding worth raising is the other
+    case: a key with no owner-only file behind it (an `export` in a
+    world-readable rc, or nothing on disk at all).
+    """
+
+    def _env(self, monkeypatch, name="MYAPP_API_KEY",
+             value="sk-EXAMPLE-other-value-111111111"):
+        monkeypatch.setattr(rexmod.os, "environ", {name: value})
+        return name
+
+    def test_owner_only_source_is_visible_but_uncharged(self, monkeypatch, tmp_path):
+        src = tmp_path / ".env"
+        src.write_text("MYAPP_API_KEY=whatever\n")
+        src.chmod(0o600)
+        monkeypatch.setattr(rexmod, "_CREDENTIAL_SOURCE_FILES", (str(src),))
+        name = self._env(monkeypatch)
+        status, out = rexmod.AuditEngine()._run_section("Environment Secrets")
+        assert status == "info", f"owner-only credential scored {status!r}"
+        assert name in out
+        assert "owner-only source" in out
+        assert "NO owner-only source" not in out
+
+    def test_world_readable_source_is_a_finding(self, monkeypatch, tmp_path):
+        src = tmp_path / "rc"
+        src.write_text("export MYAPP_API_KEY=whatever\n")
+        src.chmod(0o644)
+        monkeypatch.setattr(rexmod, "_CREDENTIAL_SOURCE_FILES", (str(src),))
+        name = self._env(monkeypatch)
+        status, out = rexmod.AuditEngine()._run_section("Environment Secrets")
+        assert status == "warn"
+        assert name in out
+        assert "NO owner-only source" in out
+        assert "0o644" in out, "the finding must say which file leaks it"
+
+    def test_exported_only_credential_is_a_finding(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(rexmod, "_CREDENTIAL_SOURCE_FILES", ())
+        name = self._env(monkeypatch)
+        status, out = rexmod.AuditEngine()._run_section("Environment Secrets")
+        assert status == "warn"
+        assert "no known file defines it" in out
+        assert name in out
+
+    def test_negative_control_the_verdict_tracks_the_file_mode(
+            self, monkeypatch, tmp_path):
+        """The same key, the same host, one chmod apart.
+
+        If the section only counted names, both runs would return the same
+        status — so this control fails whenever the classification stops being
+        read from the filesystem.
+        """
+        src = tmp_path / ".env"
+        src.write_text("MYAPP_API_KEY=whatever\n")
+        monkeypatch.setattr(rexmod, "_CREDENTIAL_SOURCE_FILES", (str(src),))
+        name = self._env(monkeypatch)
+
+        src.chmod(0o600)
+        guarded, _ = rexmod.AuditEngine()._run_section("Environment Secrets")
+        src.chmod(0o644)
+        leaky, out = rexmod.AuditEngine()._run_section("Environment Secrets")
+
+        assert guarded != leaky, "mode change did not change the verdict"
+        assert (guarded, leaky) == ("info", "warn")
+        assert name in out
+
+    def test_hardcoded_secret_is_still_masked_in_output(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(rexmod, "_CREDENTIAL_SOURCE_FILES", ())
+        self._env(monkeypatch, value="sk-EXAMPLE-mask-value-0000000000")
+        _, out = rexmod.AuditEngine()._run_section("Environment Secrets")
+        assert "sk-EXAMPLE-mask-value-0000000000" not in out
+        assert "sk-E****00" in out
+
+    def test_credential_sources_reads_modes_and_skips_absent_files(
+            self, monkeypatch, tmp_path):
+        guarded = tmp_path / "guarded.env"
+        guarded.write_text("MYAPP_API_KEY=x\n")
+        guarded.chmod(0o600)
+        missing = tmp_path / "nope.env"
+        monkeypatch.setattr(rexmod, "_CREDENTIAL_SOURCE_FILES",
+                            (str(guarded), str(missing)))
+        hits = rexmod.credential_sources("MYAPP_API_KEY")
+        assert [h[0] for h in hits] == [str(guarded)]
+        assert hits[0][1] is True and hits[0][2] == "0o600"
+        # A name the files do not define is not sourced at all.
+        assert rexmod.credential_sources("SOME_OTHER_TOKEN") == []
 
 
 class TestSuidClassification:

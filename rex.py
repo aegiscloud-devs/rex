@@ -120,7 +120,7 @@ IS_LINUX = _OS == "Linux"
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.6.1"
+VERSION  = "1.6.4"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -138,6 +138,76 @@ _FIND_NOISE = re.compile(
 # as a finding line, and published as a medium-severity *fixable* defect with
 # no path — a load-induced timeout dressed up as a vulnerability.
 _CMD_FAILED = re.compile(r"^\[(?:timeout|not found|error[:/]?.*)\]$", re.IGNORECASE)
+
+# sudo(8) refusing to answer at all. That output is a refusal, not a rule set,
+# so a section that turns it into a finding is scoring absence of evidence.
+_SUDO_REFUSED = re.compile(
+    r"(?:password is required|no tty present|no askpass|a terminal is required|"
+    r"is not in the sudoers file|not allowed to execute)",
+    re.IGNORECASE,
+)
+
+# One `NOPASSWD:` clause in `sudo -l` output.
+_SUDO_NOPASSWD_RE = re.compile(r"NOPASSWD\s*:\s*(.+)$")
+
+# Targets that make a NOPASSWD entry equivalent to `NOPASSWD: ALL`: an editor,
+# shell, interpreter or file-mover runs arbitrary commands once it runs as root.
+_SUDO_ESCAPE_TARGET = re.compile(
+    r"^/(?:usr/)?(?:local/)?(?:bin|sbin)/(?:sh|bash|dash|zsh|ksh|csh|tcsh|"
+    r"env|python[0-9.]*|perl|ruby|node|php|lua|awk|gawk|find|vim?|nano|emacs|"
+    r"less|more|man|tar|cp|mv|dd|tee|cat|sed|systemctl|service|docker|podman|"
+    r"mount|umount|pkexec|su|sudo|visudo|chmod|chown|install|gcc|cc|make|git|"
+    r"curl|wget|ssh|scp|rsync|crontab|at)$"
+)
+
+
+def classify_sudo_grant(spec):
+    """Return ``(risk, why)`` for one command spec in a NOPASSWD list.
+
+    The audit used to treat every NOPASSWD entry as equally bad, which is what
+    a stock Linux Mint host trips over: its four entries are root-owned helper
+    scripts in /usr/lib that grant nothing a user could not already do. The
+    distinction that matters is whether the grant is a *fixed, root-owned, not
+    writable* task or a door into arbitrary root execution.
+    """
+    spec = spec.strip()
+    if not spec:
+        return "warn", "empty grant"
+    if spec.startswith("!"):
+        return "ok", "denied by a negation — not a grant"
+    if spec.upper() == "ALL" or "*" in spec:
+        return "warn", "wildcard target grants arbitrary commands as root"
+
+    target = spec.split()[0]
+    if _SUDO_ESCAPE_TARGET.match(target):
+        return "warn", f"{target} is a shell/editor/interpreter — root on demand"
+    if not os.path.isabs(target):
+        return "warn", f"{target!r} is not an absolute path — resolution can be hijacked"
+    try:
+        st = os.stat(target)
+    except OSError:
+        return "warn", f"{target} does not exist — the grant points at nothing"
+    if st.st_uid != 0:
+        return "warn", f"{target} is not root-owned (uid {st.st_uid})"
+    if st.st_mode & 0o022:
+        return "warn", (f"{target} is group/world-writable "
+                        f"(mode {oct(st.st_mode & 0o777)})")
+    return "ok", f"{target} is a root-owned, non-writable fixed task"
+
+
+def classify_sudo_output(out):
+    """Split `sudo -l` output into (grants, risky) with reasons."""
+    grants = []
+    for line in (out or "").splitlines():
+        m = _SUDO_NOPASSWD_RE.search(line)
+        if not m:
+            continue
+        for spec in m.group(1).split(","):
+            if not spec.strip():
+                continue
+            risk, why = classify_sudo_grant(spec)
+            grants.append((spec.strip(), risk, why))
+    return grants, [g for g in grants if g[1] == "warn"]
 
 
 def _probe_failed(out) -> bool:
@@ -284,12 +354,85 @@ def _is_secret_var(name, value):
         return not _looks_like_path(value)
     return False
 
+
+# Where credential material normally lives, in preference order. The audit does
+# not police this list — it *classifies* against it: the finding is not "a key
+# is in the environment" (every agent host has that) but "a key is in the
+# environment with no owner-only file behind it", which is the case that has no
+# access control at all and is what the old section could not tell apart.
+_CREDENTIAL_SOURCE_FILES = (
+    "~/.aegiscode/.env",
+    "~/.aegisc/.env",
+    "~/.config/aegisc/.env",
+    "~/.env",
+    "~/.config/environment.d",
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.profile",
+    "~/.zshrc",
+    "/etc/environment",
+)
+
+
+def _owner_only(path, st):
+    """True when neither the file nor its directory grants group/other bits.
+
+    A 0600 file inside a 0755 directory is still readable by nobody else, but a
+    0640 file inside a 0700 directory is not readable either — the mode of the
+    file alone cannot answer "who else can read this", so both are checked.
+    """
+    if st.st_mode & 0o077:
+        return False
+    try:
+        dst = os.stat(os.path.dirname(os.path.abspath(path)))
+    except OSError:
+        return False
+    return (dst.st_mode & 0o077) == 0
+
+
+def credential_sources(name):
+    """Owner-only status of every known file that defines `name`.
+
+    Returns ``[(path, owner_only, mode_string)]``; empty means the variable is
+    present in this process environment and defined nowhere on disk that rex
+    knows about.
+    """
+    hits = []
+    for raw in _CREDENTIAL_SOURCE_FILES:
+        path = os.path.expanduser(raw)
+        if os.path.isdir(path):
+            continue
+        try:
+            st = os.stat(path)
+            with open(path, errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if re.search(rf"^[ \t]*(?:export[ \t]+)?{re.escape(name)}[ \t]*=",
+                     text, re.MULTILINE):
+            hits.append((path, _owner_only(path, st),
+                         oct(st.st_mode & 0o777)))
+    return hits
+
 # ============================================================
 # AI PROVIDERS
 # ============================================================
 # DeepSeek exposes an OpenAI-compatible /chat/completions endpoint.
 DEEPSEEK_URL   = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-flash"
+
+# The accountless lane. Pollinations' OpenAI-compatible endpoint serves an
+# anonymous tier that needs no API key and no signup, so `--fix --provider
+# pollinations` works on a host that has no account, no key, and no local
+# model — which is the whole point: rex can be installed and used end to end
+# without ever identifying anyone.
+#
+# The trade is explicit and must not be papered over: it is the one hosted
+# provider that is anonymous, and *not* private. The finding text leaves the
+# machine and is answered by a shared, rate-limited tier. Ollama remains the
+# only provider where nothing leaves the machine at all.
+POLLINATIONS_URL   = "https://text.pollinations.ai/openai"
+POLLINATIONS_MODEL = "openai"
 
 # Remediation replies are a handful of shell commands, but the DeepSeek
 # reasoning models bill hidden chain-of-thought against max_tokens — a small
@@ -298,7 +441,38 @@ AI_MAX_TOKENS  = 8192
 
 # Single source of truth for the AI-provider dropdown: the combo index must
 # match the position of the provider id here, and the saved config value.
-PROVIDER_IDS = ["ollama", "claude", "deepseek"]
+# `pollinations` is the keyless/anonymous hosted lane; `ollama` stays first
+# because it is the private default and the fallback in _provider_for.
+PROVIDER_IDS = ["ollama", "claude", "deepseek", "pollinations"]
+
+# Providers that need no credential of any kind. An agent can check this
+# instead of inferring it from the CLI flags: anything here is usable on a
+# host with no account, no key and no local model server.
+KEYLESS_PROVIDERS = ["ollama", "pollinations"]
+
+# Providers that cannot answer without a credential. Naming them lets the
+# resolver below refuse to hand one a keyless host.
+KEY_REQUIRED_PROVIDERS = ["claude", "deepseek"]
+
+# Total anonymity is the *default*, not a flag you have to remember. Only
+# `pollinations` works on a host that has no account, no key AND no local model
+# server, so that is what a bare `npm i -g aegis-rex` gets: `rex --fix <sec>`
+# identifies nobody, on a fresh machine, with no setup step in between.
+#
+# REX_ANONYMOUS=0 restores the historic ollama-first fallback for anyone who
+# wants local-first resolution instead; --anonymous forces the keyless lane
+# regardless of saved config.
+DEFAULT_PROVIDER  = "pollinations"
+ANONYMOUS_ENV     = "REX_ANONYMOUS"
+_ANON_OFF         = {"0", "false", "no", "off"}
+
+
+def anonymous_mode() -> bool:
+    """True unless the caller explicitly opts out via REX_ANONYMOUS=0."""
+    return os.environ.get(ANONYMOUS_ENV, "1").strip().lower() not in _ANON_OFF
+
+# Providers where the finding text never leaves the machine.
+LOCAL_PROVIDERS = ["ollama"]
 
 # Same design tokens as the ÆGIS Desktop (Electron) app's
 # desktop/renderer/style.css :root palette, so rex reads as the same product
@@ -1081,12 +1255,54 @@ class AuditEngine:
                 return status, out or "Could not query privileges"
 
             else:  # Linux + macOS
-                out = cmd(["sudo", "-l"], timeout=8)
-                if not out or "[error" in out or "[not found]" in out:
-                    return "warn", "Could not retrieve sudo rules (sudo -l failed)"
-                status = "warn" if "NOPASSWD" in out else "ok"
-                return status, out
-
+                # `sudo -n` is the non-interactive form: it succeeds from
+                # cached/absent-password rights and otherwise fails at once.
+                # Bare `sudo -l` blocks on a password prompt, which an audit
+                # tool must never do — it has no terminal to answer.
+                out = cmd(["sudo", "-n", "-l"], timeout=8)
+                # Refused means *unassessed*, not defective. The old code
+                # returned warn here, which charged 5 points of score and
+                # published a medium-severity fixable finding for a host that
+                # was merely password-gated — absence of evidence dressed as a
+                # vulnerability, the same failure mode fixed in 1.6.0 for
+                # `find` timeouts. Status "info" is neutral in the score.
+                #
+                # Only the FIRST line can be a refusal: _cmd merges stderr
+                # after stdout, so on success the rule list is line 1 and a
+                # refusal never is.
+                first = next((ln for ln in (out or "").splitlines()
+                              if ln.strip()), "")
+                if _probe_failed(out) or _SUDO_REFUSED.search(first):
+                    return "info", (
+                        "Sudo rules could not be read without a password "
+                        "(`sudo -n -l` was refused).\n"
+                        f"Probe output: {out.strip() or 'no output'}\n"
+                        "This is absence of evidence, not a finding: NOPASSWD "
+                        "entries are UNVERIFIED on this host, not absent. Re-run "
+                        "as root (or with a cached sudo timestamp) for the real "
+                        "rule set."
+                    )
+                grants, risky = classify_sudo_output(out)
+                if not grants:
+                    return "ok", out
+                summary = ["=== NOPASSWD grants ==="]
+                for spec, risk, why in grants:
+                    summary.append(f"{'⚠' if risk == 'warn' else '✓'}  "
+                                   f"NOPASSWD: {spec} — {why}")
+                body = "\n".join(summary) + "\n\n=== sudo -l (raw) ===\n" + out
+                if risky:
+                    # A real door into root: ALL/wildcard, a shell or editor,
+                    # something not root-owned, or a writable target.
+                    return "warn", body
+                # Grants exist but every one is a fixed, root-owned,
+                # non-writable task — a stock distribution's helper scripts.
+                # Nothing for a user to remediate, so it must not be scored as
+                # a defect; "info" keeps it visible without charging the score.
+                return "info", (
+                    body + "\n\nEvery NOPASSWD entry above is a fixed, "
+                    "root-owned, non-writable target — a packaged helper, not "
+                    "a path to arbitrary root execution."
+                )
         # ── SSH Config ────────────────────────────────────────
         elif section == "SSH Config":
             if IS_WIN:
@@ -1577,25 +1793,67 @@ class AuditEngine:
 
         # ── Environment Secrets ───────────────────────────────
         elif section == "Environment Secrets":
-            suspicious, clean = [], []
+            managed, exposed, clean = [], [], []
             for k, v in os.environ.items():
-                if _is_secret_var(k, v):
-                    masked = (v[:4] + "****" + v[-2:]) if len(v) > 6 else "****"
-                    suspicious.append(f"⚠  {k} = {masked}")
-                else:
+                if not _is_secret_var(k, v):
                     clean.append(k)
+                    continue
+                masked = (v[:4] + "****" + v[-2:]) if len(v) > 6 else "****"
+                srcs = credential_sources(k)
+                if srcs and all(owner_only for _, owner_only, _ in srcs):
+                    managed.append((k, masked, srcs))
+                else:
+                    exposed.append((k, masked, srcs))
+
             out_parts = []
-            if suspicious:
+            if managed:
+                lines = []
+                for k, masked, srcs in managed[:40]:
+                    try:
+                        rel = "~/" + os.path.relpath(srcs[0][0],
+                                                     os.path.expanduser("~"))
+                    except ValueError:
+                        rel = srcs[0][0]
+                    lines.append(f"✓  {k} = {masked}  ← {rel} "
+                                 f"(mode {srcs[0][2]}, owner-only)")
                 out_parts.append(
-                    f"=== Potential secrets ({len(suspicious)}) ===\n"
-                    + "\n".join(suspicious[:40])
-                    + ("\n[truncated…]" if len(suspicious) > 40 else "")
+                    f"=== Credential variables from an owner-only source "
+                    f"({len(managed)}) ===\n" + "\n".join(lines)
+                    + ("\n[truncated…]" if len(managed) > 40 else "")
+                )
+            if exposed:
+                lines = []
+                for k, masked, srcs in exposed[:40]:
+                    if not srcs:
+                        why = "no known file defines it — session/exported only"
+                    else:
+                        why = ", ".join(f"{p} (mode {m})" for p, ok, m in srcs)
+                    lines.append(f"⚠  {k} = {masked}  ← {why}")
+                out_parts.append(
+                    f"=== Credential variables with NO owner-only source "
+                    f"({len(exposed)}) ===\n" + "\n".join(lines)
+                    + ("\n[truncated…]" if len(exposed) > 40 else "")
                 )
             out_parts.append(
                 f"=== Clean variables ({len(clean)}) ===\n"
-                + ("None detected." if not clean else f"{len(clean)} variables — no suspicious names or values.")
+                + ("None detected." if not clean
+                   else f"{len(clean)} variables — no suspicious names or values.")
             )
-            return ("warn" if suspicious else "ok"), "\n\n".join(out_parts)
+            out = "\n\n".join(out_parts)
+
+            if exposed:
+                return "warn", out
+            if managed:
+                # Every credential here is defined in a file that grants no
+                # group/other access and is inherited by this process because
+                # the agent deliberately loads it. That is a configuration, not
+                # a defect; "info" keeps it visible without charging the score.
+                return "info", (
+                    out + "\n\nAll credential variables above are defined in an "
+                    "owner-only file — the exposure is this process environment, "
+                    "not an unguarded file on disk."
+                )
+            return "ok", out
 
         # ── Sensitive File Permissions ────────────────────────
         elif section == "Sensitive File Permissions":
@@ -1915,6 +2173,55 @@ def provider_stream(provider: str, prompt: str, cfg: dict,
         except Exception as e:  # noqa: BLE001
             return "", f"[Error: {e}]"
 
+    if provider == "pollinations":
+        # No key, no account, no Authorization header. The anonymous tier is
+        # reached by simply not identifying anyone, so there is no credential
+        # here to configure, leak, or bill — and no code path in this branch
+        # reads one.
+        model = cfg.get("pollinations_model") or POLLINATIONS_MODEL
+        base  = cfg.get("pollinations_url") or POLLINATIONS_URL
+        status(f"Querying {model} (anonymous, no key)…")
+        payload = json.dumps({
+            "model":      model,
+            "max_tokens": AI_MAX_TOKENS,
+            "stream":     False,
+            "messages": [
+                {"role": "system",
+                 "content": "You output only raw shell commands. Never explain, "
+                            "never use markdown or code fences."},
+                {"role": "user", "content": prompt},
+            ],
+        }).encode()
+        req = urllib.request.Request(base, data=payload, headers={
+            "Content-Type": "application/json",
+            "Accept":       "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                chunk = json.loads(resp.read().decode("utf-8", errors="replace"))
+            choices = chunk.get("choices") or []
+            message = (choices[0].get("message") or {}) if choices else {}
+            # `reasoning` is the shared tier's chain-of-thought — the same trap
+            # as DeepSeek's reasoning_content. The caller wants the commands.
+            text = (message.get("content") or "").strip()
+            if not text:
+                return "", ("[Pollinations returned no content — the shared "
+                            "anonymous tier may be rate-limited. Retry, or use "
+                            "--provider ollama|claude|deepseek.]")
+            emit(text)
+            return text, None
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 402):
+                return "", (f"[Pollinations anonymous tier busy ({e.code}) — no "
+                            "account is required, but the shared tier is "
+                            "rate-limited. Retry, or use another provider.]")
+            body = e.read().decode("utf-8", errors="replace")
+            return "", f"[Pollinations API error {e.code}: {body[:300]}]"
+        except urllib.error.URLError as e:
+            return "", f"[Pollinations unreachable: {e.reason}]"
+        except Exception as e:  # noqa: BLE001
+            return "", f"[Error: {e}]"
+
     return "", f"[Unknown provider: {provider}]"
 
 
@@ -1931,6 +2238,8 @@ def load_provider_config(provider: str | None = None, **overrides) -> dict:
         "claude_model":      cfg.get("claude_model")      or CLAUDE_MODEL,
         "deepseek_model":    cfg.get("deepseek_model")    or DEEPSEEK_MODEL,
         "deepseek_url":      cfg.get("deepseek_url")      or DEEPSEEK_URL,
+        "pollinations_url":   cfg.get("pollinations_url")   or POLLINATIONS_URL,
+        "pollinations_model": cfg.get("pollinations_model") or POLLINATIONS_MODEL,
         "claude_api_key":    cfg.get("claude_api_key")    or os.environ.get("ANTHROPIC_API_KEY", ""),
         "deepseek_api_key":  cfg.get("deepseek_api_key")  or os.environ.get("DEEPSEEK_API_KEY", ""),
     }
@@ -2548,9 +2857,13 @@ def capabilities() -> dict:
              "emits": SCHEMA_AUDIT,
              "exit_codes": [EXIT_CLEAN, EXIT_FINDINGS, EXIT_USAGE]},
             {"flag": "--fix", "summary": "Ask a provider for the fix to one finding. "
-                                         "Never applies anything without --apply.",
+                                         "Never applies anything without --apply. "
+                                         "Refuses (commands [], no_finding true, "
+                                         "provider null) when the section's own "
+                                         "verdict is not fixable; --force prompts "
+                                         "anyway.",
              "args": ["SECTION_OR_ID", "--provider", "--model", "--report FILE",
-                      "--print-prompt", "--apply", "--yes", "--json"],
+                      "--print-prompt", "--apply", "--yes", "--force", "--json"],
              "emits": SCHEMA_FIX,
              "exit_codes": [EXIT_CLEAN, EXIT_FINDINGS, EXIT_USAGE, EXIT_PROVIDER, EXIT_APPLY]},
         ],
@@ -2579,16 +2892,62 @@ def capabilities() -> dict:
             "ollama":   {"requires": ["ollama serve"],
                          "config_keys": ["ollama_url", "ollama_model"],
                          "env": [], "default_model": OLLAMA_MODEL,
+                         "api_key_required": False, "account_required": False,
+                         "anonymous": True,
+                         "leaves_machine": False,
                          "auto_pulls_model": True},
+            "pollinations": {"requires": [],
+                         "config_keys": ["pollinations_url", "pollinations_model"],
+                         "env": [], "default_model": POLLINATIONS_MODEL,
+                         "api_key_required": False, "account_required": False,
+                         "anonymous": True,
+                         "default": DEFAULT_PROVIDER == "pollinations",
+                         "leaves_machine": True,
+                         "anonymous_tier": True,
+                         "note": "Keyless, accountless hosted lane: no API key, no "
+                                 "signup, no attribution header. Anonymous, NOT "
+                                 "private — the finding text leaves the machine and "
+                                 "the shared tier is rate-limited (429 is retryable, "
+                                 "not a configuration error). Chain-of-thought in "
+                                 "`reasoning` is discarded, never returned as commands."},
             "claude":   {"requires": ["api key"],
                          "config_keys": ["claude_api_key", "claude_model"],
-                         "env": ["ANTHROPIC_API_KEY"], "default_model": CLAUDE_MODEL},
+                         "env": ["ANTHROPIC_API_KEY"], "default_model": CLAUDE_MODEL,
+                         "api_key_required": True, "account_required": True,
+                         "anonymous": False,
+                         "leaves_machine": True},
             "deepseek": {"requires": ["api key"],
                          "config_keys": ["deepseek_api_key", "deepseek_model", "deepseek_url"],
                          "env": ["DEEPSEEK_API_KEY"], "default_model": DEEPSEEK_MODEL,
+                         "api_key_required": True, "account_required": True,
+                         "anonymous": False,
+                         "leaves_machine": True,
                          "note": "reasoning models bill hidden chain-of-thought against "
                                  f"max_tokens ({AI_MAX_TOKENS}); an empty reply means the "
                                  "budget went on reasoning."},
+        },
+        # Machine-readable anonymity contract, so an agent does not have to
+        # infer it: the audit and the pollinations lane need no account, no key
+        # and no install id, and nothing in rex calls home.
+        "anonymity": {
+            "account_required": False,
+            "api_key_required": False,
+            "install_id": None,
+            "telemetry": False,
+            "analytics": False,
+            "calls_home": [],
+            "anonymous_by_default": anonymous_mode(),
+            "default_provider": DEFAULT_PROVIDER if anonymous_mode() else "ollama",
+            "keyless_providers": list(KEYLESS_PROVIDERS),
+            "local_providers": list(LOCAL_PROVIDERS),
+            "audit_network_calls": [],
+            "opt_out_env": f"{ANONYMOUS_ENV}=0",
+            "force_lane_flag": "--anonymous",
+            "note": "The audit path makes no outbound connection at all. --fix is the "
+                    "only thing that can reach the network, and only for the provider "
+                    "you name; `pollinations` completes it without identifying anyone. "
+                    "Anonymous is not the same as private: only ollama keeps the "
+                    "finding on this machine.",
         },
         "config_file": CONFIG_PATH,
         "safety": {
@@ -2662,10 +3021,20 @@ def _build_argparser():
                    help="run checks one at a time (easier to follow in a log)")
     p.add_argument("--fix", metavar="SECTION",
                    help="ask a provider for the remediation of one finding")
+    p.add_argument("--force", action="store_true",
+                   help="with --fix: build the prompt even when the section's "
+                        "own audit status is clean/info. Off by default: a "
+                        "prompt for a non-finding yields invented remediation.")
     p.add_argument("--provider", choices=PROVIDER_IDS, help="AI provider for --fix")
     p.add_argument("--model", help="override the provider's model")
     p.add_argument("--api-key", help="override the provider's API key")
+    p.add_argument("--anonymous", action="store_true",
+                   help="force the keyless, accountless lane (" + DEFAULT_PROVIDER +
+                        ") even if a provider key is configured; this is already "
+                        "the default for a host that has none")
     p.add_argument("--ollama-url", help=f"Ollama base URL (default: {OLLAMA_URL})")
+    p.add_argument("--pollinations-url",
+                   help=f"keyless anonymous lane base URL (default: {POLLINATIONS_URL})")
     p.add_argument("--report", metavar="FILE",
                    help="reuse findings from a previous --audit --json report")
     p.add_argument("--print-prompt", action="store_true",
@@ -2695,9 +3064,26 @@ def _emit(payload, as_json: bool, text: str = ""):
 
 
 def _provider_for(args, cfg) -> str:
+    """Resolve the AI provider — anonymously, unless told otherwise.
+
+    Order: --anonymous > --provider > saved config > the keyless lane.
+
+    Two rules keep this "total anonymous" rather than merely "supports
+    anonymous": an unconfigured host resolves to the accountless lane instead
+    of ollama (which needs a model server the fresh install does not have), and
+    a provider that cannot work without a credential is never selected when no
+    credential exists — it falls back to the keyless lane instead of failing
+    with a key error. Nothing here can make rex ask a user to identify.
+    """
+    if getattr(args, "anonymous", False):
+        return DEFAULT_PROVIDER
+
     provider = args.provider or cfg.get("provider") or _load_config().get("ai_provider")
     if provider not in PROVIDER_IDS:
-        provider = "ollama"
+        provider = DEFAULT_PROVIDER if anonymous_mode() else "ollama"
+
+    if provider in KEY_REQUIRED_PROVIDERS and not cfg.get(f"{provider}_api_key"):
+        return DEFAULT_PROVIDER
     return provider
 
 
@@ -2893,6 +3279,30 @@ def _cli_main(argv) -> int:
         else:
             engine  = AuditEngine([section], scan_path=scan_path)
             _status, finding = engine.collect([section])[section]
+            # A section that is clean or merely informational has nothing to
+            # remediate. Asking the model anyway produced a confident list of
+            # commands for a finding that did not exist — the model cannot say
+            # "there is no finding", it can only answer the prompt it is given.
+            # The status is the audit's own verdict, so it is the authority
+            # here: refuse instead, and say which verdict was reached.
+            if not args.force and _status not in FIXABLE_STATUSES:
+                note = (f"{section!r} is {_status} on this host — nothing to "
+                        f"remediate, so no provider was contacted. "
+                        f"(--force overrides.)")
+                if args.json:
+                    _emit({
+                        "schema": SCHEMA_FIX, "tool": APP_NAME, "version": VERSION,
+                        "section": section, "section_id": section_id(section),
+                        "provider": None, "model": None,
+                        "redacted_finding": False, "prompt": None,
+                        "status": _status, "no_finding": True,
+                        "error": None, "commands": [], "blocked": [],
+                        "needs_sudo": [], "applied": False,
+                        "apply_results": None,
+                    }, True, note)
+                else:
+                    print(note)
+                return EXIT_CLEAN
 
         prompt = build_prompt(section, finding)
         cfg    = load_provider_config(
@@ -3039,6 +3449,21 @@ class DeepSeekWorker(_ProviderWorker):
                           "deepseek_url": base_url})
 
 
+class PollinationsWorker(_ProviderWorker):
+    """The accountless lane: no key, no signup, no attribution header.
+
+    Nothing is read from the environment or the config file but the URL and
+    model, so there is no credential in this worker to leak — which is the
+    property that makes rex usable on a host that identifies nobody.
+    """
+
+    def __init__(self, prompt: str, model: str = POLLINATIONS_MODEL,
+                 base_url: str = POLLINATIONS_URL):
+        super().__init__(prompt, "pollinations",
+                         {"pollinations_model": model,
+                          "pollinations_url":   base_url})
+
+
 
 class ApplyWorker(QThread):
     progress = pyqtSignal(str)
@@ -3088,7 +3513,9 @@ class RemediationDialog(QDialog):
                  claude_model: str = "claude-haiku-4-5-20251001",
                  deepseek_api_key: str = "",
                  deepseek_model: str = DEEPSEEK_MODEL,
-                 deepseek_url: str = DEEPSEEK_URL):
+                 deepseek_url: str = DEEPSEEK_URL,
+                 pollinations_model: str = POLLINATIONS_MODEL,
+                 pollinations_url: str = POLLINATIONS_URL):
         super().__init__(parent)
         self.setWindowTitle(f"AI Fix — {section}")
         self.resize(700, 520)
@@ -3128,6 +3555,7 @@ class RemediationDialog(QDialog):
 
         provider_label = {
             "claude": "Claude", "deepseek": "DeepSeek",
+            "pollinations": "Pollinations (anonymous, no key)",
         }.get(provider, "Ollama")
         lbl_fix = QLabel(f"🤖  {provider_label} suggestion  (you can edit before applying):")
         lbl_fix.setStyleSheet(f"color:{COLORS['cyan']};font-weight:bold;")
@@ -3167,6 +3595,11 @@ class RemediationDialog(QDialog):
         elif provider == "deepseek":
             self._worker = DeepSeekWorker(prompt, deepseek_model,
                                           deepseek_api_key, deepseek_url)
+        elif provider == "pollinations":
+            # No credential is passed, because the lane has none: the anonymous
+            # tier is requested by asking without identifying anyone.
+            self._worker = PollinationsWorker(prompt, pollinations_model,
+                                              pollinations_url)
         else:
             self._worker = OllamaWorker(prompt, ollama_model, ollama_url)
         self._worker.status_update.connect(self._on_status)
@@ -3478,7 +3911,7 @@ class SecurityAuditWindow(QMainWindow):
         sb.addWidget(lbl_ai)
 
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["Ollama", "Claude", "DeepSeek"])
+        self.provider_combo.addItems(["Ollama", "Claude", "DeepSeek", "Pollinations (no key)"])
         self.provider_combo.setStyleSheet(
             f"background:{COLORS['bg3']};color:{COLORS['text2']};border:1px solid {COLORS['border']};"
             f"border-radius:6px;padding:3px 6px;font-size:10px;"
@@ -3943,6 +4376,9 @@ class SecurityAuditWindow(QMainWindow):
                 claude_model=self.claude_model.text().strip(),
                 deepseek_api_key=self.deepseek_api_key.text().strip(),
                 deepseek_model=self.deepseek_model.text().strip() or DEEPSEEK_MODEL,
+                # No fields to read: the pollinations lane has no URL/model
+                # widget because it has nothing to configure — naming the
+                # provider is the entire setup.
             )
             dlg.exec()
             if dlg.applied_output:
