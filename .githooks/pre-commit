@@ -1,0 +1,83 @@
+#!/bin/sh
+# pre-commit guard — installed by aegiscodex auto-add-hooks (src/autohooks.js)
+# at 2026-09-30T13:07:03.790Z
+#
+# Blocks staged paths and staged content that must not enter history: secrets,
+# runtime state, build artifacts and plan documents. Repo-local and
+# self-contained on purpose — no node, no network, no shared library, so it
+# behaves identically in a fresh clone.
+#
+# Bypass (deliberate, loud): git commit --no-verify
+# Turn the installer off: export AEGIS_AUTO_ADD_HOOKS=0
+
+set -u
+
+BLOCKED_PATH_RE='(^|/)(node_modules|__pycache__|\.git|dist|build|out|release|coverage|target|venv|\.venv|Pods)(/|$)|(^|/)\.env([.-]|$)|(^|/)\.npmrc$|(^|/)(id_rsa|id_ed25519|credentials\.json|secrets?\.(json|ya?ml))$|\.(log|db|sqlite3|pem|key|p12|pfx)$'
+SECRET_RE='sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AEGIS_(MEMORY|DEVICE|OAUTH)_TOKEN=[A-Za-z0-9]'
+PLAN_DOC_RE='(^|/)plans?/|(^|/)plans?[-_]?docs?/|(^|/)plans?([-_.][^/]*)?[.](md|markdown|txt)$|(^|/)[^/]*plans?[.](md|markdown|txt)$'
+
+fail() {
+  echo "✗ pre-commit blocked: $1" >&2
+  echo "  Remove the flagged content, or pass --no-verify (and rotate any" >&2
+  echo "  secret that was staged)." >&2
+  exit 1
+}
+
+staged=$(
+  git diff --cached --name-only -z \
+    | tr '\0' '\n' \
+    | sed '/^$/d' || true
+)
+
+bad_paths=$(printf '%s\n' "$staged" | grep -iE "$BLOCKED_PATH_RE" || true)
+if [ -n "$bad_paths" ]; then
+  echo "$bad_paths" | while IFS= read -r p; do echo "  $p" >&2; done
+  fail "runtime state, secrets or build artifacts are staged"
+fi
+
+bad_plans=$(printf '%s\n' "$staged" | grep -iE "$PLAN_DOC_RE" || true)
+if [ -n "$bad_plans" ]; then
+  echo "$bad_plans" | while IFS= read -r p; do echo "  $p" >&2; done
+  fail "plan documents are staged (plans live in ~/plan, never in a repo)"
+fi
+
+# Content scan is bounded to text-ish, non-deleted blobs so a binary in a
+# commit cannot make this slow, and so an unmerged or deleted path is skipped.
+secret_hits=$(
+  git diff --cached --diff-filter=ACMR --no-color -U0 \
+    | grep -E '^\+' | grep -vE '^\+\+\+' | grep -E "$SECRET_RE" || true
+)
+if [ -n "$secret_hits" ]; then
+  printf '%s\n' "$secret_hits" | head -5 | sed 's/^\(.\{0,120\}\).*/  \1/' >&2
+  fail "a staged line looks like a live credential"
+fi
+
+# A single blob over 5 MiB is almost never something a human meant to commit.
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  size=$(git cat-file -s ":$p" 2>/dev/null || echo 0)
+  if [ "${size:-0}" -gt 5242880 ]; then
+    fail "staged file larger than 5 MiB: $p ($size bytes)"
+  fi
+done <<EOF
+$staged
+EOF
+
+# ── agent-key gate (tools/agent-gate.mjs + .aegis/guard.json) ───────────────
+# "Only the holder of the agent key may manipulate this code." Policy lives in
+# .aegis/guard.json; the decision function lives in tools/agent-gate.mjs; this is
+# the shell edge of it.
+#
+# LAST, deliberately: the path blocklist and the secret scan above are
+# unconditional and must not become conditional on a key being present.
+#
+# Fail-closed: a missing gate CLI, missing node or unreadable manifest refuses.
+# The one bypass is AEGIS_GATE_SKIP=1 — an env var, so it is greppable.
+# shellcheck source=.githooks/lib-gate.sh
+. "$(dirname "$0")/lib-gate.sh"
+if ! agent_gate_check_staged; then
+    echo "✗ pre-commit blocked: the agent-key gate refused this commit (reason above)." >&2
+    exit 1
+fi
+
+exit 0
