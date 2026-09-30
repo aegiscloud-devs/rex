@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "comment": [
+    "The agent-key gate for this repository. Read tools/agent-gate.mjs's header before",
+    "trusting anything here: this file is the RECEIPT, not the lock. It stops a copied",
+    "tree, a borrowed laptop and a casual collaborator, and it makes a deliberate edit",
+    "leave a trail. It cannot stop someone who has the bytes \u2014 they delete this file.",
+    "The real lock is a GitHub ruleset on main: run `agent-gate.mjs lock-status`.",
+    "",
+    "HASHES ONLY. Never put a key in this file: it is committed, and the repo's own",
+    "pre-commit guard scans staged content for exactly that mistake. The key lives at",
+    "$AEGIS_HOME/keys/agent.key (mode 0600), outside the tree.",
+    "",
+    "sha256 = sha256('aegiscode-agent-gate-v1\\n' + key)  \u2014 see KEY_DOMAIN in tools/agent-gate.mjs",
+    "The engine re-implements this in aegiscodex-dev/src/repoguard.js; a shared test",
+    "vector in aegiscode-plugin/test/agent-gate.test.mjs holds the two in step."
+  ],
+  "mode": "enforce",
+  "read": "open",
+  "protect": [
+    "**"
+  ],
+  "keys": [
+    {
+      "id": "agent-key-1",
+      "label": "primary agent key",
+      "sha256": "912d4e0689b27cd3fae298aa282a9af27d13b15086590300422679619703bdde",
+      "status": "burned",
+      "addedAt": "2026-09-30T13:18:55.820Z",
+      "keySource": "stdin",
+      "exposure": "PROVIDED-IN-CHAT",
+      "burnedAt": "2026-09-30T18:39:02.106Z",
+      "burnedReason": "rotated (disclosed in a chat transcript; rotated from aegiscode-plugin, mirrored here to match)"
+    },
+    {
+      "id": "key-2",
+      "sha256": "d5b3996fd1b0341e4ce32fba2a3056d759ab9ef0e5a42cd97ce69b22c7471851",
+      "label": "key-2",
+      "status": "active",
+      "addedAt": "2026-09-30T18:39:02.106Z",
+      "keySource": "/home/neo/.aegiscode/keys/agent.key"
+    }
+  ],
+  "machines": [
+    "8e2c3fd01adda701"
+  ],
+  "machinesNote": "Machine binding is a speed bump, not identity: the fingerprint is a hash of public facts plus a per-install salt (keys/machine.salt), so it is reproducible on this install and not by guessing. Adding a machine is explicit (bind-machine); moving the key file does not carry the binding. `init` binds the machine that runs it, because the alternative is an operator locked out by their own manifest."
+}
