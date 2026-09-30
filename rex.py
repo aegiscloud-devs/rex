@@ -117,6 +117,113 @@ IS_WIN   = _OS == "Windows"
 IS_MAC   = _OS == "Darwin"
 IS_LINUX = _OS == "Linux"
 
+# ── Platform adaptation layer ───────────────────────────────────────────────
+# rex ships to Windows, macOS, the apt/dnf/pacman/zypper/apk families, every
+# BSD, and to containers that report one of those while shipping almost none of
+# their tooling. A three-way split drops everything else into "none of the
+# three", which a security tool reads as "nothing to audit" rather than "never
+# understood" -- the worst possible failure mode. So platform facts are derived
+# ONCE, from evidence (PATH + disk), not from the OS string alone.
+IS_BSD  = _OS in ("FreeBSD", "OpenBSD", "NetBSD", "DragonFly")
+IS_UNIX = (not IS_WIN) and (IS_LINUX or IS_MAC or IS_BSD)
+# WSL reports as Linux but is not a normal Linux host: shared Windows kernel,
+# NTFS over 9p, no real systemd under WSL1.
+IS_WSL = False
+if IS_LINUX:
+    try:
+        with open("/proc/version") as _fh:
+            IS_WSL = "microsoft" in _fh.read().lower()
+    except OSError:
+        IS_WSL = False
+
+ARCH = platform.machine() or "unknown"
+PLATFORM_SUPPORTED = IS_WIN or IS_MAC or IS_LINUX or IS_BSD
+
+
+def plat_is_root():
+    """Full administrative rights here (Windows has no geteuid)."""
+    if IS_WIN:
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
+# pip leads on purpose: rex is a Python app, so on a host that has both apt and
+# pip, `apt install PyQt6` does not exist while `pip install PyQt6` does.
+_PKG_MANAGERS = (
+    ("pip3",    [sys.executable, "-m", "pip", "install"]),
+    ("pkg",     ["pkg", "install", "-y"]),                     # FreeBSD
+    ("apk",     ["apk", "add"]),                               # Alpine
+    ("apt-get", ["apt-get", "install", "-y"]),
+    ("dnf",     ["dnf", "install", "-y"]),
+    ("yum",     ["yum", "install", "-y"]),
+    ("pacman",  ["pacman", "-S", "--noconfirm"]),
+    ("zypper",  ["zypper", "--non-interactive", "install"]),
+    ("brew",    ["brew", "install"]),                          # macOS
+    ("winget",  ["winget", "install", "--accept-source-agreements",
+                 "--accept-package-agreements", "-e", "--id"]),
+    ("choco",   ["choco", "install", "-y"]),
+    ("scoop",   ["scoop", "install"]),
+)
+
+
+def plat_package_manager():
+    """First usable package manager as (name, argv_prefix), else (None, None)."""
+    for name, argv in _PKG_MANAGERS:
+        if name == "pip3":
+            try:
+                import importlib.util
+                if importlib.util.find_spec("pip") is None:
+                    continue
+            except Exception:
+                continue
+        elif not shutil.which(name):
+            continue
+        return name, list(argv)
+    return None, None
+
+
+def plat_shell():
+    """The shell a remediation command should actually be handed to."""
+    if IS_WIN:
+        return os.environ.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
+    return os.environ.get("SHELL") or shutil.which("bash") or "/bin/sh"
+
+
+def plat_service_manager():
+    """Whichever init/service control this platform really provides."""
+    if IS_WIN:
+        return "sc" if shutil.which("sc") else None
+    if IS_MAC:
+        return "launchctl"
+    for _name in ("systemctl", "rcctl", "rc-service", "service"):
+        if shutil.which(_name):
+            return _name
+    return None
+
+
+def plat_report():
+    """How rex adapted to THIS host -- lets an agent ask what works here."""
+    _pkg, _argv = plat_package_manager()
+    return {
+        "os": _OS,
+        "family": ("windows" if IS_WIN else "macos" if IS_MAC
+                   else "linux" if IS_LINUX else "bsd" if IS_BSD else "other"),
+        "supported": PLATFORM_SUPPORTED,
+        "arch": ARCH, "wsl": IS_WSL, "root": plat_is_root(),
+        "shell": plat_shell(), "service_manager": plat_service_manager(),
+        "package_manager": _pkg, "package_install": _argv,
+        "python": platform.python_version(),
+        "frozen": bool(getattr(sys, "frozen", False)),
+    }
+# ── end platform adaptation layer ───────────────────────────────────────────
+
 # ============================================================
 # KONFIGURATION
 # ============================================================
