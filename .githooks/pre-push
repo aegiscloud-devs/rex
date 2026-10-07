@@ -1,0 +1,125 @@
+#!/bin/sh
+#
+# rex — this checkout's own pre-push gate.
+#
+# WHAT WAS WRONG BEFORE THIS FILE EXISTED
+#   `.githooks/push-policy` has been in this repo since 18:12 on 2026-09-30. Its
+#   own first line says it is "Sourced by .githooks/pre-push" — and there WAS no
+#   pre-push, while `core.hooksPath=.githooks` means git never looks in
+#   `.git/hooks`. So the policy was inert: a file every reader would take for an
+#   armed control, and the one repo on this machine listed as PUBLIC
+#   (`AEGIS_PUBLIC_REPOS="aegiscode-plugin rex"`) had nothing standing between a
+#   `git push devs main` and publishing the source to the world.
+#
+#   That is the failure this file closes. Three checks, in order, all of them
+#   arguments a push can actually fail:
+#
+#   1. THE DESTINATION POLICY (`.githooks/push-policy`). rex is PUBLIC by
+#      design — it is an open-source audit tool, not a private product — so the
+#      rule is not "block it", it is "make publishing a deliberate act":
+#      `AEGIS_ALLOW_PUBLIC_PUSH=1` for this repo, printed loudly when used.
+#      A rule that legitimate work cannot satisfy gets --no-verify'd, and a
+#      bypassed guard protects nothing.
+#
+#   2. THE AGENT-KEY GATE (`.githooks/lib-gate.sh` — the same decision function
+#      the pre-commit guard calls), so the key policy covers what LEAVES the
+#      machine, not only what enters history. A tree whose history was gated on
+#      the way in and never on the way out is gated on the wrong side.
+#
+#   3. THE REVIEW GATE (the aegis-review shim, managed block below). It refuses
+#      a push when the session's own closing report asserts nothing this tool
+#      can re-derive. Installed by aegis-review's `hooks/install-into-repo.sh`,
+#      which OWNS the block between the markers — do not hand-edit inside them;
+#      re-run the installer instead.
+#
+# WHY STDIN IS CAPTURED FIRST
+#   pre-push is handed "<local ref> <local sha> <remote ref> <remote sha>" per
+#   line on stdin, and stdin is consumed on read. Two of the three checks below
+#   want it (the agent gate diffs the range; the review gate reads it before its
+#   own work). Reading it once here and re-feeding each consumer is the only
+#   order in which neither one is starved. This was a real defect in the first
+#   cut of this pattern elsewhere on this machine.
+#
+# FAIL CLOSED, on every path: no node, no gate CLI, an unreadable manifest, a
+# missing review.mjs or a review that cannot run all REFUSE the push and say
+# which one it was. Silence must never read as a pass.
+#
+# OVERRIDES — each deliberately greppable, each printed every time it fires:
+#   AEGIS_ALLOW_PUBLIC_PUSH=1   publishing to the public repo is intended
+#   AEGIS_GATE_SKIP=1           the agent-key gate (also skips it in pre-commit)
+#   AEGIS_ALLOW_UNREVIEWED_PUSH=1   the review gate (aegis-review's own override)
+#
+set -u
+
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+refuse() {
+    echo "✗ rex pre-push: $1" >&2
+    shift
+    for _line in "$@"; do echo "  $_line" >&2; done
+    exit 1
+}
+
+# --- stdin, read exactly once and kept for the checks that need it ----------
+REFS=$(cat)
+
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+echo "· rex pre-push: destination policy + agent-key gate + review gate" >&2
+
+# --- 1. the destination policy ---------------------------------------------
+policy="$(dirname "$0")/push-policy"
+if [ -f "$policy" ]; then
+    # shellcheck source=.githooks/push-policy
+    . "$policy"
+fi
+: "${AEGIS_PUSH_ACCOUNT:=aegiscloud-devs}"
+: "${AEGIS_PUBLIC_REPOS:=}"
+
+case "$remote_url" in
+    *"$AEGIS_PUSH_ACCOUNT"/*)
+        for pub in $AEGIS_PUBLIC_REPOS; do
+            case "$remote_url" in
+                *"$AEGIS_PUSH_ACCOUNT/$pub"*|*"$AEGIS_PUSH_ACCOUNT/$pub.git"*)
+                    if [ "${AEGIS_ALLOW_PUBLIC_PUSH:-}" != "1" ]; then
+                        refuse "'$pub' under '$AEGIS_PUSH_ACCOUNT' is PUBLIC — a push there publishes rex to the world." \
+                               "That is the intended destination for this tool, but it is a deliberate act, not a habit." \
+                               "If publishing is what you mean:  AEGIS_ALLOW_PUBLIC_PUSH=1 git push $remote_name $remote_url"
+                    fi
+                    echo "⚠ rex pre-push: pushing to PUBLIC '$pub' (AEGIS_ALLOW_PUBLIC_PUSH=1) — this publishes source" >&2
+                    ;;
+            esac
+        done
+        ;;
+    "")
+        echo "  destination: not given on the command line (hook run by hand?) — push-policy not judged" >&2
+        ;;
+    *)
+        echo "  destination: $remote_url is not under $AEGIS_PUSH_ACCOUNT — push-policy does not vouch for it" >&2
+        ;;
+esac
+
+# --- 2. the agent-key gate, on the commits this push would send -------------
+if [ "${AEGIS_GATE_SKIP:-}" = "1" ]; then
+    echo "⚠ agent-gate SKIPPED (AEGIS_GATE_SKIP=1) — this push is unverified" >&2
+else
+    # shellcheck source=.githooks/lib-gate.sh
+    . "$(dirname "$0")/lib-gate.sh"
+    if printf '%s\n' "$REFS" | agent_gate_check_push_paths; then
+        echo "  agent-gate: keyed push verified" >&2
+    else
+        refuse "the agent-key gate refused this push (reason above)." \
+               "Only the holder of the agent key may publish this code." \
+               "Deliberate bypass, and it is loud:  AEGIS_GATE_SKIP=1 git push $remote_name $remote_url"
+    fi
+fi
+
+# --- 3. the review gate (managed block — re-arm with aegis-review's installer)
+# >>> aegis-review pre-push gate — managed block, do not edit by hand >>>
+if [ -x "$(dirname "$0")/aegis-review-pre-push" ]; then
+  printf '%s\n' "$REFS" | "$(dirname "$0")/aegis-review-pre-push" "$@" || exit $?
+fi
+# <<< aegis-review pre-push gate — managed block <<<
+
+exit 0
