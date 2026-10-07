@@ -146,7 +146,12 @@ def plat_is_root():
         try:
             import ctypes
             return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
+        except (AttributeError, OSError):
+            # AttributeError: this interpreter has no `ctypes.windll` (the
+            # IS_WIN branch taken under a non-Windows ctypes build is exactly
+            # the case a bare `except Exception` would have hidden).
+            # OSError: the call itself refused. Both mean "cannot prove admin",
+            # which is the same answer as "not admin" for every caller here.
             return False
     try:
         return os.geteuid() == 0
@@ -177,11 +182,19 @@ def plat_package_manager():
     """First usable package manager as (name, argv_prefix), else (None, None)."""
     for name, argv in _PKG_MANAGERS:
         if name == "pip3":
+            # `pip` can be absent (embedded interpreter, stripped venv) and
+            # find_spec can raise on a malformed sys.path entry. Both mean
+            # "this manager is not usable here", and neither is worth a
+            # traceback — but the exception is named rather than blind, and the
+            # decision is expressed as a value instead of a `continue` from
+            # inside the handler (S112: a continue in an except arm is how a
+            # swallow becomes invisible).
+            import importlib.util
             try:
-                import importlib.util
-                if importlib.util.find_spec("pip") is None:
-                    continue
-            except Exception:
+                has_pip = importlib.util.find_spec("pip") is not None
+            except (ImportError, ValueError):
+                has_pip = False
+            if not has_pip:
                 continue
         elif not shutil.which(name):
             continue
@@ -227,7 +240,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.6.4"
+VERSION  = "1.6.5"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
