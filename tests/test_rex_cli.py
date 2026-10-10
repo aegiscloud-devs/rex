@@ -1411,3 +1411,74 @@ class TestClamavEngineSelection:
             lines=("eicar.txt: Eicar-Test-Signature FOUND",))
         assert status == "critical"
         assert "THREAT" in out
+
+
+class TestReadmeCountsStayTrue:
+    """The README's inventory must track SECTIONS, not a memory of it.
+
+    Measured 2026-10-10 (rex 1.6.5): the engine ran all 19 sections while the
+    README still advertised "16 audit sections" and a 17-row table — the two
+    sections added in 1.6.x (Intrusion Prevention (fail2ban), Malware &
+    Rootkit Scanners) were undocumented, and the table's "Virus Scan" row no
+    longer named the section it points at. A count written as a literal in
+    prose is one `SECTIONS` edit away from being a lie, so it is asserted here
+    instead of trusted.
+    """
+
+    NUMBER_WORDS = {16: "sixteen", 17: "seventeen", 18: "eighteen",
+                    19: "nineteen", 20: "twenty"}
+
+    @staticmethod
+    def readme_text():
+        return (ROOT / "README.md").read_text(errors="replace")
+
+    @staticmethod
+    def documented_sections(text):
+        """First-column names of the README's '## Audit sections' table."""
+        table = text.split("## Audit sections", 1)[1].split("\n###", 1)[0]
+        names = set()
+        for line in table.splitlines():
+            if not line.startswith("|"):
+                continue
+            first = line.split("|")[1].strip()
+            if not first or first == "Section" or set(first) <= set("-: "):
+                continue
+            names.add(first)
+        return names
+
+    @classmethod
+    def problems(cls, text):
+        """Every disagreement between the README and the engine's SECTIONS."""
+        out = []
+        m = re.search(r"\*\*(\d+) audit sections\*\*", text)
+        if not m:
+            out.append("the features bullet no longer declares a section count")
+        elif int(m.group(1)) != len(rexmod.SECTIONS):
+            out.append(f"bullet says {m.group(1)}, rex.py defines {len(rexmod.SECTIONS)}")
+
+        word = cls.NUMBER_WORDS.get(len(rexmod.SECTIONS))
+        if word and f"four of the {word} sections" not in text:
+            out.append(f"psutil note does not say 'four of the {word} sections'")
+
+        documented = cls.documented_sections(text)
+        missing = sorted(set(rexmod.SECTIONS) - documented)
+        stale = sorted(documented - set(rexmod.SECTIONS))
+        if missing:
+            out.append(f"undocumented section(s): {missing}")
+        if stale:
+            out.append(f"stale row(s) that name no section: {stale}")
+        return out
+
+    def test_readme_documents_every_section(self):
+        problems = self.problems(self.readme_text())
+        assert not problems, (
+            "README.md and rex.py disagree about the audit inventory: "
+            + "; ".join(problems))
+
+    def test_the_check_is_not_vacuous(self):
+        """Negative control: the guard must report the pre-fix README."""
+        text = self.readme_text()
+        assert self.problems(text.replace("19 audit sections", "16 audit sections")), \
+            "a wrong section count passed the guard"
+        assert self.problems(text.replace("| Firewall |", "")), \
+            "a dropped table row passed the guard"
