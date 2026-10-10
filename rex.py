@@ -35,8 +35,9 @@ try:
     import psutil
 except ImportError:
     # Agent/CI containers routinely ship a bare python3. psutil is only
-    # needed by 4 of the 16 audit sections, so a missing lib must not
-    # make the CLI or the JSON contract unimportable.
+    # needed by a few audit sections (PSUTIL_GATED_SECTIONS below — a count
+    # written here as a literal is one bump away from being a lie), so a
+    # missing lib must not make the CLI or the JSON contract unimportable.
     psutil = None
 
 # ── Qt is optional ───────────────────────────────────────────

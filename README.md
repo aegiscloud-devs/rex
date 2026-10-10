@@ -8,7 +8,7 @@ Single Python file. No server. No telemetry. Runs entirely on your machine.
 
 ## Features
 
-- **16 audit sections** — system info, open ports, firewall, SSH config, SUID/SGID files, world-writable files, sudo privileges, startup services, scheduled tasks, environment secrets, and more
+- **19 audit sections** — system info, open ports, firewall, fail2ban, SSH config, SUID/SGID files, world-writable files, sudo privileges, startup services, scheduled tasks, environment secrets, malware/rootkit scanners, and more
 - **Virus scan** — ClamAV integration (optional)
 - **AI Fix (Ollama · Pollinations · Claude · DeepSeek)** — select any finding, ask an LLM for a remediation, review the suggested commands, and apply them with one click. Ollama is local; Pollinations needs no key and no account
 - **Export** — save the full audit report as a `.json` file
@@ -61,7 +61,7 @@ provider in one document, so a caller never has to scrape `--help` prose.
 
 PyQt6 is **not** needed for any `--` command — the GUI import is deferred, so a
 bare interpreter can import the audit core. `psutil` is optional as well: without
-it, four of the sixteen sections (`cpu-memory`, `disk`, `network`,
+it, four of the nineteen sections (`cpu-memory`, `disk`, `network`,
 `running-processes`) report status `error` and are listed in `summary.unassessed`,
 because a check that could not run is absent evidence, not a pass. The score
 drops accordingly; that is a missing module, not a broken host.
@@ -159,6 +159,7 @@ $ python3 rex.py --fix ssh-config --provider pollinations --apply --yes
 | Running Processes | top processes by CPU/memory |
 | Startup Services | enabled systemd / launchd / startup items |
 | Firewall | ufw / iptables / pf / Windows Firewall status |
+| Intrusion Prevention (fail2ban) | fail2ban installed, enabled and its jail policy |
 | Users & Groups | local accounts, sudoers membership |
 | Sudo / Privileges | `sudo -n -l` rule set; each `NOPASSWD` grant is classified as a fixed root-owned task or a door to arbitrary root |
 | SSH Config | PermitRootLogin, PasswordAuthentication, key settings |
@@ -167,7 +168,8 @@ $ python3 rex.py --fix ssh-config --provider pollinations --apply --yes
 | World-Writable Files | files/dirs writable by any user |
 | Environment Secrets | credentials in the environment, split by whether an owner-only file defines them |
 | Sensitive File Permissions | ssh keys, .env files and config files with loose permissions |
-| Virus Scan | ClamAV scan of your home directory (path editable in the GUI) |
+| Malware & Rootkit Scanners | which scanners are installed (ClamAV, rkhunter, chkrootkit, Lynis, AIDE, unhide), definition age, scheduled scans, AppArmor |
+| Virus Scan (ClamAV) | ClamAV scan of your home directory (path editable in the GUI) |
 
 ### What rex will not call a finding
 
