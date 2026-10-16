@@ -134,6 +134,62 @@ def section_id_ok(finding):
     return rexmod.section_id(finding["section"]) == finding["id"]
 
 
+def test_summary_buckets_account_for_every_section_that_ran(audit):
+    """clean + info + fixable must equal sections_run.
+
+    Every finding is exactly one of ok / info / one of FIXABLE_STATUSES, so
+    those three buckets partition the sections that ran. `info` had no summary
+    key at all, which made the text line report "0 finding(s), 16 clean, 0 n/a"
+    against 19 sections run: three sections that ran and had something to say
+    were absent from the human-readable output while the JSON carried them.
+    The counts are now checked, not assumed.
+    """
+    s = audit[1]["summary"]
+    assert "info" in s, "summary lost its info bucket"
+    assert s["clean"] + s["info"] + s["fixable"] == s["sections_run"]
+    # not_applicable is a subset of clean (an N/A check reports status "ok"),
+    # so it must never be added into the partition above.
+    assert s["not_applicable"] <= s["clean"]
+    info = [f["id"] for f in audit[1]["findings"] if f["status"] == "info"]
+    assert s["info"] == len(info)
+
+
+def test_text_summary_reconciles_and_prints_info_findings():
+    """The non-JSON summary must agree with the report it summarises.
+
+    The printer used to gate on `f["fixable"]`, so an `info` section never
+    appeared, and it printed `s['fixable']` under the label "finding(s)", so a
+    report whose only finding was informational printed "0 finding(s)". This
+    asserts the numbers reconcile and that every non-ok finding in the JSON is
+    visible in the text — the two outputs are the same audit.
+    """
+    sections = "sudo-privileges,environment-secrets,virus-scan-clamav"
+    text = run("--audit", "--sections", sections)
+    assert text.returncode == 0, text.stderr
+    _, report = run_json("--audit", "--json", "--sections", sections)
+    s = report["summary"]
+
+    m = re.search(
+        r"(\d+) fixable, (\d+) info, (\d+) clean, (\d+) n/a \((\d+) sections run\)",
+        text.stdout,
+    )
+    assert m, f"unrecognised summary line:\n{text.stdout}"
+    fixable, info, clean, na, ran = (int(g) for g in m.groups())
+    assert (fixable, info, clean) == (s["fixable"], s["info"], s["clean"])
+    assert na == s["not_applicable"] and ran == s["sections_run"]
+    assert fixable + info + clean == ran
+
+    # Anything the JSON calls not-ok is named in the text output.
+    for f in report["findings"]:
+        if f["status"] != "ok":
+            assert f["id"] in text.stdout, (
+                f"{f['id']} is {f['status']} in the report but missing from "
+                f"the text summary")
+    # An `info` finding is labelled by its status, not severity "none".
+    if info:
+        assert "none " not in text.stdout
+
+
 def test_audit_fail_on_warn_exits_one(audit):
     """The threshold contract: --fail-on warn must exit 1 on a host with
     warn-level findings (this host reports several)."""

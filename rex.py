@@ -241,7 +241,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.6.5"
+VERSION  = "1.6.6"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -2934,7 +2934,17 @@ def build_report(results: dict, scan_path: str | None = None, include_output: bo
         "summary": {
             "sections_expected": len(SECTIONS),
             "sections_run":      len(results),
+            # These buckets are disjoint and sum to sections_run: every finding
+            # is ok, info, or one of FIXABLE_STATUSES (warn/critical/error), so
+            # clean + info + fixable accounts for every section that ran.
+            # `info` used to have no key at all, so a reader could not tell
+            # "no such section ran" from "a section ran and had nothing to
+            # report" -- the text summary printed 16 clean against 19 sections
+            # run and silently lost the other three. `not_applicable` is a
+            # SUBSET of `clean` (an N/A check reports status "ok"), so it is
+            # deliberately not part of the disjoint sum.
             "clean":             sum(1 for f in findings if f["status"] == "ok"),
+            "info":              sum(1 for f in findings if f["status"] == "info"),
             "fixable":           sum(1 for f in findings if f["fixable"]),
             "not_applicable":    sum(1 for f in findings if not f["applicable"]),
             "unassessed":        sum(1 for f in findings if f["status"] == "error"),
@@ -3362,11 +3372,32 @@ def _cli_main(argv) -> int:
         else:
             s = report["summary"]
             print(f"{APP_NAME} v{VERSION} — {report['hostname']} ({report['platform']})")
-            print(f"score {s['score']} ({s['grade']}) — {s['fixable']} finding(s), "
-                  f"{s['clean']} clean, {s['not_applicable']} n/a")
+            # Every bucket is named and they sum to sections_run, so a reader
+            # can add the line up. It read "— {fixable} finding(s)" while
+            # counting only warn/critical/error: an audit whose single finding
+            # was informational printed "0 finding(s)" next to a JSON payload
+            # carrying that finding, and the `info` sections appeared in
+            # neither bucket, so three of 19 sections were simply absent from
+            # the text output.
+            print(f"score {s['score']} ({s['grade']}) — "
+                  f"{s['fixable']} fixable, {s['info']} info, "
+                  f"{s['clean']} clean, {s['not_applicable']} n/a "
+                  f"({s['sections_run']} sections run)")
+            # Fixable findings first — they are the ones with an action — but
+            # print info as well. It used to be filtered out entirely, which is
+            # how a section that ran and had something to say became invisible.
+            # `--fix` refuses an info section (see FIXABLE_STATUSES above), so
+            # the informational line is context, not a to-do: the severity
+            # column already distinguishes them.
             for f in report["findings"]:
-                if f["fixable"]:
-                    print(f"  {f['severity']:<8} {f['id']:<28} {f['section']}")
+                if f["status"] == "ok":
+                    continue
+                # `info` maps to severity "none" (nothing is wrong), which
+                # would print a severity column reading "none". Print the
+                # status word instead so the line says what it is; fixable
+                # findings keep the severity grade they have always shown.
+                label = f["severity"] if f["fixable"] else f["status"]
+                print(f"  {label:<8} {f['id']:<28} {f['section']}")
 
     # ── fix ──────────────────────────────────────────────────
     if args.fix:
