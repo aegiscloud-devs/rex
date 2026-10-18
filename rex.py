@@ -2394,6 +2394,32 @@ DANGER_PATTERNS = [
     (r"(?:wget|curl)\b[^|]*\|\s*(?:ba|z|da|k)?sh\b", "remote code execution via pipe"),
     (r"base64\s+.*\|\s*(?:ba)?sh\b", "obfuscated remote execution"),
     (r"!!!", "invalid sudoers syntax"),
+    # ── Firewall / MAC teardown ───────────────────────────────────────────
+    # The list above covered destruction of the filesystem and of credential
+    # files, but nothing that removes the host's *network* defences — and a
+    # model asked to "fix" an unreachable port reaches for exactly these.
+    # `ufw disable` scored an empty reason (measured on 1.6.6), so it passed
+    # classify_commands as executable and was auto-runnable under --apply.
+    # Enabling/reading the firewall stays allowed: `ufw enable`, `ufw allow`,
+    # `iptables -L`, `iptables -S` and `nft list ruleset` are the hardening
+    # and audit commands, so only the disabling forms are listed.
+    (r"\bufw\b[^|;&]*\b(?:disable|reset)\b",   "disables the firewall"),
+    (r"\biptables\b[^|;&]*\s(?:-F|--flush)\b", "flushes firewall rules"),
+    (r"\biptables\b[^|;&]*\s(?:-X|--delete-chain)\b", "deletes firewall chains"),
+    # Only ACCEPT is flagged: `-P INPUT DROP` is default-deny, the hardening
+    # state ufw itself reports as DEFAULT_INPUT_POLICY, and the --harden plan
+    # relies on that policy. Blaming DROP would block the fix, not the attack.
+    (r"\biptables\b[^|;&]*\s-P\s+\S+\s+ACCEPT\b", "opens the default firewall policy"),
+    (r"\bnft\b[^|;&]*\b(?:flush|delete)\b", "deletes firewall rules"),
+    (r"\bsystemctl\b[^|;&]*\b(?:stop|disable|mask)\b[^|;&]*\b(?:ufw|firewalld|nftables|iptables)\b",
+     "stops the firewall service"),
+    (r"\bsetenforce\b[^|;&]*\b0\b",            "disables SELinux enforcement"),
+    # AppArmor: `apparmor_parser -R` unloads a profile while `-r` merely
+    # replaces/refreshes it (the hardening action). danger_reason searches
+    # case-insensitively, which cannot tell the two apart, so the flag is
+    # pinned uppercase with a scoped (?-i:) group rather than matched loosely.
+    (r"\bapparmor_parser\b[^|;&]*(?-i:-R)\b",  "unloads AppArmor profiles"),
+    (r"\baa-disable\b",                        "disables an AppArmor profile"),
 ]
 
 # Too dangerous to auto-execute even with sudo — always leave to a human.

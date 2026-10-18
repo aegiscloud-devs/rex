@@ -1,5 +1,7 @@
 PyQt6>=6.4.0
-# optional: without it 4 of the 16 audit sections (CPU & Memory, Disk,
-# Network, Running Processes) report "warn". The other 12 sections, the
-# CLI and the JSON contract run on the standard library alone.
+# optional: without it the 4 psutil-gated sections (CPU & Memory, Disk,
+# Network, Running Processes) report status "error" and land in
+# summary.unassessed - a check that could not run is absent evidence, not a
+# pass ("warn" was wrong: nothing was scanned). The other 15 of the 19
+# sections, the CLI and the JSON contract run on the standard library alone.
 psutil>=5.9.0
