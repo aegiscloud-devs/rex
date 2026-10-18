@@ -1683,3 +1683,102 @@ class TestOptionalDepsNoteStaysTrue:
             'the wrong status ("warn" for an unassessed section) passed the guard'
         assert self.problems(text.replace("CPU & Memory", "")), \
             "a dropped gated section passed the guard"
+
+
+# --------------------------------------------------------------------------
+# Open Ports — UDP must be visible, and attribution must not be fooled
+# --------------------------------------------------------------------------
+class TestOpenPorts:
+    """The section used to probe TCP only, so a UDP-only exposure was invisible.
+
+    These tests pin the three things that fix has to keep doing: see UDP, stay
+    quiet on a stock desktop, and still flag a stranger — including a stranger
+    squatting on a port the allowlist happens to name.
+    """
+
+    # Real `ss -tulnpe` rows from a stock Ubuntu desktop. Note the random avahi
+    # UDP ports: no fixed allowlist can name 33471/51736, which is precisely
+    # why ownership is consulted instead of port numbers alone.
+    LIVE = (
+        "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+        "udp   UNCONN 0      0      127.0.0.54:53      0.0.0.0:*  uid:991 ino:1 sk:1 "
+        "cgroup:/system.slice/systemd-resolved.service <->\n"
+        "udp   UNCONN 0      0       0.0.0.0:33471    0.0.0.0:*  uid:110 ino:2 sk:2 "
+        "cgroup:/system.slice/avahi-daemon.service <->\n"
+        "udp   UNCONN 0      0       0.0.0.0:5353     0.0.0.0:*  uid:110 ino:3 sk:3 "
+        "cgroup:/system.slice/avahi-daemon.service <->\n"
+        "udp   UNCONN 0      0          [::]:51736       [::]:*  uid:110 ino:4 sk:4 "
+        "cgroup:/system.slice/avahi-daemon.service v6only:1 <->\n"
+        "tcp   LISTEN 0      4096    127.0.0.1:9050   0.0.0.0:*  users:((\"tor\",pid=9,fd=6)) "
+        "uid:1000 ino:5 sk:5 cgroup:/user.slice/tor.service <->\n"
+    )
+
+    def classify(self, text):
+        return rexmod._classify_listeners(text)
+
+    def test_udp_is_collected_at_all(self):
+        """The regression that mattered: UDP never reached the parser."""
+        lan, _, _, _ = self.classify(self.LIVE)
+        assert "0.0.0.0:33471" in lan
+        assert "[::]:51736" in lan
+
+    def test_stock_desktop_is_quiet(self):
+        lan, unexpected, _, suspicious = self.classify(self.LIVE)
+        assert unexpected == [] and suspicious == []
+        assert lan, "the negative control needs a non-empty lan set to mean anything"
+
+    def test_random_port_from_unknown_owner_flags(self):
+        rogue = self.LIVE + (
+            "udp   UNCONN 0 0  0.0.0.0:33472  0.0.0.0:*  uid:1000 ino:9 sk:9 "
+            "cgroup:/user.slice/session-2.scope <->\n")
+        _, unexpected, _, _ = self.classify(rogue)
+        assert unexpected == ["0.0.0.0:33472"]
+
+    def test_random_port_without_attribution_still_flags(self):
+        """No ids visible (unprivileged ss on some kernels) must not mean 'clean'."""
+        _, unexpected, _, _ = self.classify("udp UNCONN 0 0 0.0.0.0:33471 0.0.0.0:*\n")
+        assert unexpected == ["0.0.0.0:33471"]
+
+    def test_squatter_on_an_expected_port_flags(self):
+        """A known port is not a licence: a named stranger on 5353 is a squatter."""
+        row = ('udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:* '
+               'users:(("evilbin",pid=999,fd=3))\n')
+        _, unexpected, _, _ = self.classify(row)
+        assert unexpected == ["0.0.0.0:5353"]
+
+    def test_malware_port_is_suspicious_even_on_loopback(self):
+        _, _, _, suspicious = self.classify("tcp LISTEN 0 1 127.0.0.1:4444 0.0.0.0:*\n")
+        assert suspicious == ["127.0.0.1:4444"]
+
+    def test_loopback_is_not_reachable_off_host(self):
+        lan, _, loopback, _ = self.classify("tcp LISTEN 0 4096 127.0.0.1:11434 0.0.0.0:*\n")
+        assert lan == [] and loopback == ["127.0.0.1:11434"]
+
+    def test_wrapped_detail_rows_are_not_parsed(self):
+        """`ss -e` wraps fields onto continuation lines that look like data."""
+        lan, unexpected, _, suspicious = self.classify("\t cubic cwnd:10\n")
+        assert (lan, unexpected, suspicious) == ([], [], [])
+
+    def test_parser_handles_both_column_layouts(self):
+        """-tlnp has no Netid column; -tulnpe does. One parser, both layouts."""
+        with_netid = "tcp   LISTEN 0 4096 0.0.0.0:4007 0.0.0.0:*\n"
+        plain_netstat = "tcp   0  0 0.0.0.0:4007 0.0.0.0:* LISTEN\n"
+        for row in (with_netid, plain_netstat):
+            _, unexpected, _, _ = self.classify(row)
+            assert unexpected == ["0.0.0.0:4007"], f"layout not handled: {row!r}"
+
+    def test_section_end_to_end_flags_a_udp_exposure(self, monkeypatch):
+        rogue = self.LIVE + (
+            "udp   UNCONN 0 0  0.0.0.0:33472  0.0.0.0:*  uid:1000 ino:9 sk:9 "
+            "cgroup:/user.slice/session-2.scope <->\n")
+        monkeypatch.setattr(rexmod.AuditEngine, "_cmd",
+                            staticmethod(lambda *a, **k: rogue))
+        status, out = rexmod.AuditEngine()._run_section("Open Ports")
+        assert status == "warn"
+        assert "33472" in out
+
+    def test_section_end_to_end_is_quiet_on_stock_rows(self, monkeypatch):
+        monkeypatch.setattr(rexmod.AuditEngine, "_cmd",
+                            staticmethod(lambda *a, **k: self.LIVE))
+        status, _ = rexmod.AuditEngine()._run_section("Open Ports")
+        assert status == "ok"
