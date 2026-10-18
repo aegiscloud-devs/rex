@@ -241,7 +241,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.6.7"
+VERSION  = "1.6.8"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -337,6 +337,125 @@ def _probe_failed(out) -> bool:
         not line.strip() or _CMD_FAILED.match(line.strip())
         for line in out.splitlines()
     )
+
+
+# Services that are *expected* to bind LAN-wide on a desktop. Reporting these
+# would make the section warn on every machine, and a check that always warns
+# is a check nobody reads. They are listed in the output but do not drive the
+# status.
+#
+# The port allowlist alone is not enough. avahi-daemon holds mDNS on 5353 but
+# *also* opens two randomly-numbered UDP sockets for legacy unicast responses
+# (0.0.0.0:33471 and [::]:51736 on this host). Those are wildcard-bound and
+# reachable off-host, yet no fixed port list can name them — which is exactly
+# the shape a backdoor has. Attribution is what separates the two: `ss -e`
+# reports the owning cgroup and process without root, so a wildcard socket is
+# unexpected only when *both* its port and its owner are unfamiliar.
+EXPECTED_LAN_PORTS = {"22", "53", "139", "445", "631", "5353"}
+EXPECTED_LAN_UNITS = {"avahi-daemon", "systemd-resolved", "cupsd",
+                      "cups-browsed", "sshd"}
+
+# A service bound to the wildcard address is reachable off-host. Loopback and
+# the mdns/link-local scopes are not: 127.0.0.0/8 covers the stub resolvers
+# (127.0.0.53, 127.0.0.54) and 169.254/fe80 cover IPv4/IPv6 link-local.
+_PORT_ANY_RE = re.compile(r"^(\*|0\.0\.0\.0|\[::\]|::)$")
+_PORT_LOOPBACK_RE = re.compile(
+    r"^(127\.\d+\.\d+\.\d+|\[::1\]|::1|localhost|\[::ffff:127\.[\d.]+\])"
+    r"(%.*)?$", re.IGNORECASE)
+_NETID_RE = re.compile(r"^(tcp|udp|sctp|raw)", re.IGNORECASE)
+_CGROUP_UNIT_RE = re.compile(r"cgroup:\S*?/([\w@.\-]+)\.service")
+_PROC_NAME_RE = re.compile(r'users:\(\("([^"]+)"')
+_SUSPICIOUS_PORTS = {"4444", "1337", "31337", "6666", "9999"}
+
+
+def _split_hostport(addr):
+    """Split a `ss`/`netstat` local address into (host, port) or (None, None).
+
+    Both tools print the port after the *last* colon, which is why a bare
+    rpartition covers the bracketed IPv6 form `[::]:5353` as well as
+    `127.0.0.53%lo:53`.
+    """
+    host, _, port = (addr or "").rpartition(":")
+    if not port.isdigit():
+        return None, None
+    return host, port
+
+
+def _is_loopback_host(host) -> bool:
+    return bool(_PORT_LOOPBACK_RE.match(host or ""))
+
+
+def _local_addr(parts):
+    """Return the local address:port token from a listener row.
+
+    Column layout differs by invocation: `ss -tulnpe` starts with a Netid
+    column (address in field 4) while `ss -tlnp` and `netstat` do not (address
+    in field 3). Rather than hardcode an offset that flips on a flag, take the
+    first `host:port` token after the two queue counters — the peer address
+    always comes later, so the first match is the local one.
+    """
+    for tok in parts[2:]:
+        host, port = _split_hostport(tok)
+        if host and port is not None:
+            return tok
+    return None
+
+
+def _listener_owner(line) -> str:
+    """Best-effort owner of a listener row: systemd unit, else process name.
+
+    `ss -e` emits `cgroup:/system.slice/avahi-daemon.service` and, where the
+    kernel exposes it, `users:(("tor",pid=2672,fd=8))`. Reading another user's
+    pid needs root, the cgroup path does not, so the cgroup is preferred.
+    """
+    m = _CGROUP_UNIT_RE.search(line) or _PROC_NAME_RE.search(line)
+    return m.group(1) if m else ""
+
+
+def _classify_listeners(text):
+    """Group listener rows into (lan, unexpected, loopback, suspicious).
+
+    `lan` holds every listener reachable off-host, `unexpected` the subset that
+    is neither a known port nor a known service, and `suspicious` the ports on
+    the malware-ish shortlist regardless of binding. Rows are matched on the
+    netid column and the local address in field 4, so one parser covers `ss`,
+    `netstat`, and both TCP and UDP.
+    """
+    lan, unexpected, loopback, suspicious = [], [], [], []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if _NETID_RE.match(parts[0]):
+            # `ss` with a Netid column (e.g. -tu) or `netstat` without one
+            # ("tcp 0 0 0.0.0.0:22 ...") both start with the netid.
+            pass
+        elif "LISTEN" not in parts[0]:
+            # Skips the header row and `ss -e`'s wrapped detail rows
+            # ("cubic cwnd:10"), which share no netid column.
+            continue
+        addr = _local_addr(parts)
+        host, port = _split_hostport(addr) if addr else (None, None)
+        if not host or port is None:
+            continue
+        if port in _SUSPICIOUS_PORTS:
+            suspicious.append(addr)
+        if _PORT_ANY_RE.match(host):
+            lan.append(addr)
+            owner = _listener_owner(line)
+            if owner in EXPECTED_LAN_UNITS:
+                continue  # identified expected service: not a finding
+            # A familiar *port* is not enough on its own: a stranger holding
+            # 5353 is a squatter, so an identified owner outside the expected
+            # set flags even on a known port. An unattributed socket on a known
+            # port is left alone — otherwise every host whose ss cannot report
+            # ids warns forever — but an unattributed socket on an unknown
+            # port is exactly the shape a backdoor has, and it flags.
+            if port not in EXPECTED_LAN_PORTS or owner:
+                unexpected.append(addr)
+        elif _is_loopback_host(host):
+            loopback.append(addr)
+    return lan, unexpected, loopback, suspicious
 
 
 # clamd keeps the signature database resident, so clamdscan starts scanning
@@ -983,50 +1102,38 @@ class AuditEngine:
 
         # ── Open Ports ────────────────────────────────────────
         elif section == "Open Ports":
-            suspicious = ["4444", "1337", "31337", "6666", "9999"]
             if IS_WIN:
                 out = cmd(["netstat", "-ano"], timeout=10)
             elif IS_MAC:
                 out = cmd(["netstat", "-an", "-p", "tcp"], timeout=10)
+                udp = cmd(["netstat", "-an", "-p", "udp"], timeout=10)
+                if udp and "[not found]" not in udp:
+                    out = (out or "") + "\n" + udp
                 if not out or "[not found]" in out:
-                    out = cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-n", "-P"], timeout=10)
+                    out = cmd(["lsof", "-iTCP", "-iUDP", "-n", "-P"], timeout=10)
             else:  # Linux
-                out = cmd(["ss", "-tlnp"], timeout=8)
+                # UDP is a first-class binding here, not an afterthought: mDNS
+                # (5353) and DHT/QUIC services answer on UDP only, so a
+                # `-t`-only probe reports a clean box while a wildcard UDP
+                # socket is open to the LAN. `-e` adds uid/inode/cgroup, which
+                # attributes the socket without needing root.
+                out = cmd(["ss", "-tulnpe"], timeout=8)
                 if not out or "[not found]" in out:
-                    out = cmd(["netstat", "-tlnp"], timeout=8)
+                    out = cmd(["netstat", "-tulnp"], timeout=8)
             # A port is only "open" off-host if it is bound to a non-loopback
             # address, and that is independent of how innocuous the number
             # looks — a container publishing 0.0.0.0:4007 is reachable from the
-            # LAN however arbitrary 4007 is. ss and netstat both put the local
-            # address in field 4 of a LISTEN row, so one parser covers both.
-            #
-            # A handful of services are *expected* to bind LAN-wide on a
-            # desktop; reporting those would make the section warn on every
-            # machine, and a check that always warns is a check nobody reads.
-            # They are listed in the output but do not drive the status.
-            EXPECTED_LAN = {"22", "53", "139", "445", "631", "5353"}
-            lan, unexpected = [], []
-            for line in (out or "").splitlines():
-                if "LISTEN" not in line:
-                    continue
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                host, _, port = parts[3].rpartition(":")
-                if not host or not port.isdigit():
-                    continue
-                if host.startswith("127.") or host in ("[::1]", "::1", "localhost"):
-                    continue  # loopback-only: not reachable off-host
-                lan.append(f"{parts[3]:<26} {parts[-1]}")
-                if port not in EXPECTED_LAN:
-                    unexpected.append(f"{parts[3]:<26} {parts[-1]}")
+            # LAN however arbitrary 4007 is.
+            lan, unexpected, _loopback, suspicious = _classify_listeners(out)
 
-            status = "warn" if any(p in out for p in suspicious) else "ok"
-            if unexpected:
-                status = "warn"
+            status = "warn" if suspicious or unexpected else "ok"
             if lan and not _probe_failed(out):
                 out = (out or "").rstrip() + "\n\nNon-loopback listeners " \
                     "(reachable off-host):\n  " + "\n  ".join(lan)
+            if unexpected:
+                out += "\n\nUnexpected non-loopback listeners " \
+                       "(port not in the expected set):\n  " \
+                    + "\n  ".join(unexpected)
             return status, out or "No open ports found"
 
         # ── Running Processes (psutil — all platforms) ────────
