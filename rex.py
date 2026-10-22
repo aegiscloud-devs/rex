@@ -241,7 +241,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.6.8"
+VERSION  = "1.6.9"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -355,13 +355,16 @@ EXPECTED_LAN_PORTS = {"22", "53", "139", "445", "631", "5353"}
 EXPECTED_LAN_UNITS = {"avahi-daemon", "systemd-resolved", "cupsd",
                       "cups-browsed", "sshd"}
 
-# A service bound to the wildcard address is reachable off-host. Loopback and
-# the mdns/link-local scopes are not: 127.0.0.0/8 covers the stub resolvers
-# (127.0.0.53, 127.0.0.54) and 169.254/fe80 cover IPv4/IPv6 link-local.
+# A service bound to the wildcard address *or to one of this host's own
+# unicast addresses* is reachable off-host. Loopback is not: 127.0.0.0/8
+# covers the stub resolvers (127.0.0.53, 127.0.0.54) and ::1 covers IPv6.
+# An interface-bound socket (172.17.0.1:2375, 10.0.0.5:8080) is just as
+# reachable from the network — the address only narrows which network.
 _PORT_ANY_RE = re.compile(r"^(\*|0\.0\.0\.0|\[::\]|::)$")
 _PORT_LOOPBACK_RE = re.compile(
     r"^(127\.\d+\.\d+\.\d+|\[::1\]|::1|localhost|\[::ffff:127\.[\d.]+\])"
     r"(%.*)?$", re.IGNORECASE)
+_LINK_LOCAL_RE = re.compile(r"^(169\.254\.|fe80:)", re.IGNORECASE)
 _NETID_RE = re.compile(r"^(tcp|udp|sctp|raw)", re.IGNORECASE)
 _CGROUP_UNIT_RE = re.compile(r"cgroup:\S*?/([\w@.\-]+)\.service")
 _PROC_NAME_RE = re.compile(r'users:\(\("([^"]+)"')
@@ -383,6 +386,11 @@ def _split_hostport(addr):
 
 def _is_loopback_host(host) -> bool:
     return bool(_PORT_LOOPBACK_RE.match(host or ""))
+
+
+def _is_link_local_host(host) -> bool:
+    """True for 169.254/16 and fe80::/10 — reachable only on the local segment."""
+    return bool(_LINK_LOCAL_RE.match((host or "").lstrip("[")))
 
 
 def _local_addr(parts):
@@ -415,11 +423,12 @@ def _listener_owner(line) -> str:
 def _classify_listeners(text):
     """Group listener rows into (lan, unexpected, loopback, suspicious).
 
-    `lan` holds every listener reachable off-host, `unexpected` the subset that
-    is neither a known port nor a known service, and `suspicious` the ports on
-    the malware-ish shortlist regardless of binding. Rows are matched on the
-    netid column and the local address in field 4, so one parser covers `ss`,
-    `netstat`, and both TCP and UDP.
+    `lan` holds every listener reachable off-host — wildcard-bound or bound to
+    a specific unicast address that is not loopback — `unexpected` the subset
+    that is neither a known port nor a known service, and `suspicious` the
+    ports on the malware-ish shortlist regardless of binding. Rows are matched
+    on the netid column and the local address in field 4, so one parser covers
+    `ss`, `netstat`, and both TCP and UDP.
     """
     lan, unexpected, loopback, suspicious = [], [], [], []
     for line in (text or "").splitlines():
@@ -440,7 +449,20 @@ def _classify_listeners(text):
             continue
         if port in _SUSPICIOUS_PORTS:
             suspicious.append(addr)
-        if _PORT_ANY_RE.match(host):
+        if _is_link_local_host(host):
+            # Link-local never leaves the local segment and is already covered
+            # by the wildcard-bound neighbours it exists to support; auditing
+            # it would flag every host that has an auto-configured address.
+            continue
+        if _PORT_ANY_RE.match(host) or not _is_loopback_host(host):
+            # Reachable off-host: either the wildcard address, or a specific
+            # unicast address belonging to one of this host's interfaces. The
+            # second case used to fall through the cracks — only the wildcard
+            # was counted — so `docker run -p 10.0.0.5:8080:80`, a dev server
+            # on `--bind 192.168.x.y`, and every container publishing to
+            # 172.17.0.1 were audited as invisible. A socket bound to an
+            # interface answers packets from the network just as happily as
+            # one bound to 0.0.0.0; the address only narrows *which* network.
             lan.append(addr)
             owner = _listener_owner(line)
             if owner in EXPECTED_LAN_UNITS:
@@ -453,7 +475,7 @@ def _classify_listeners(text):
             # port is exactly the shape a backdoor has, and it flags.
             if port not in EXPECTED_LAN_PORTS or owner:
                 unexpected.append(addr)
-        elif _is_loopback_host(host):
+        else:
             loopback.append(addr)
     return lan, unexpected, loopback, suspicious
 
