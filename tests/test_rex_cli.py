@@ -1754,6 +1754,37 @@ class TestOpenPorts:
         lan, _, loopback, _ = self.classify("tcp LISTEN 0 4096 127.0.0.1:11434 0.0.0.0:*\n")
         assert lan == [] and loopback == ["127.0.0.1:11434"]
 
+    def test_interface_bound_listener_is_reachable_off_host(self):
+        """Only the wildcard used to count, so `-p 172.17.0.1:2375` was invisible.
+
+        A socket bound to an interface address answers the network exactly like
+        one bound to 0.0.0.0. Missing this hid every container publishing to
+        the docker bridge, every dev server bound to a LAN address, and any
+        backdoor that picked a specific interface instead of the wildcard.
+        """
+        for row in (
+            "tcp LISTEN 0 4096 172.17.0.1:2375 0.0.0.0:*\n",
+            "tcp LISTEN 0 4096 10.45.232.249:8080 0.0.0.0:*\n",
+            "tcp LISTEN 0 4096 [2001:db8::5]:4007 [::]:*\n",
+        ):
+            lan, unexpected, loopback, _ = self.classify(row)
+            assert lan, f"interface-bound listener went unseen: {row!r}"
+            assert loopback == [], f"an interface address was called loopback: {row!r}"
+            assert unexpected, f"an unattributed unknown port was not flagged: {row!r}"
+
+    def test_expected_service_on_an_interface_address_is_quiet(self):
+        """Widening the net must not turn the stock resolver into a finding."""
+        row = ("tcp LISTEN 0 4096 10.0.0.5:53 0.0.0.0:* uid:991 ino:1 sk:1 "
+               "cgroup:/system.slice/systemd-resolved.service <->\n")
+        lan, unexpected, _, suspicious = self.classify(row)
+        assert lan and unexpected == [] and suspicious == []
+
+    def test_link_local_and_stub_resolvers_are_still_loopback_scoped(self):
+        """169.254/fe80 link-local is not audited as an off-host exposure here."""
+        for host in ("169.254.10.20", "[fe80::1]"):
+            lan, _, loopback, _ = self.classify(f"tcp LISTEN 0 4096 {host}:631 0.0.0.0:*\n")
+            assert lan == [], f"link-local counted as off-host: {host}"
+
     def test_wrapped_detail_rows_are_not_parsed(self):
         """`ss -e` wraps fields onto continuation lines that look like data."""
         lan, unexpected, _, suspicious = self.classify("\t cubic cwnd:10\n")
