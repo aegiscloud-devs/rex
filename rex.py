@@ -241,7 +241,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.6.9"
+VERSION  = "1.8.0"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -1108,9 +1108,13 @@ class AuditEngine:
 
         # ── Network (all platforms via psutil) ────────────────
         elif section == "Network":
+            posture = dns_posture()
+            dns_lines = ["", *_dns_posture_lines(posture)]
             if psutil is None:
-                # Absence of evidence, not a finding: the check never ran.
-                return "error", PSUTIL_MISSING
+                # Absence of evidence, not a finding: the interface check never
+                # ran. The DNS half needs no psutil, so it is still reported
+                # rather than hidden behind an unrelated missing dependency.
+                return "error", PSUTIL_MISSING + "\n" + "\n".join(dns_lines)
             addrs = psutil.net_if_addrs()
             stats = psutil.net_if_stats()
             out = []
@@ -1120,7 +1124,15 @@ class AuditEngine:
                 for a in addr_list:
                     if a.family == socket.AF_INET:
                         out.append(f"{iface} [{up}]  {a.address}")
-            return "ok", "\n".join(out) or "No network interfaces"
+            # Reachability is only half of the network story. A host can have no
+            # listener open to the LAN and still leak every hostname it resolves
+            # to a plaintext resolver. Appended here rather than as its own
+            # section so the section count — pinned in README and tests — holds.
+            out.extend(dns_lines)
+            status = "ok"
+            if posture.get("available") and not posture.get("secure"):
+                status = "warn"
+            return status, "\n".join(out) or "No network interfaces"
 
         # ── Open Ports ────────────────────────────────────────
         elif section == "Open Ports":
@@ -2708,7 +2720,197 @@ def apply_commands(cmds, on_progress=None, timeout=30,
 
 
 # ============================================================
-# HARDENING — deterministic remediation for fail2ban / ClamAV
+# DNS POSTURE — is name resolution encrypted and validated?
+# ============================================================
+# The audit could already say a host is firewalled and that no port is open to
+# the LAN, while every hostname it resolves still travelled in the clear. On a
+# mobile/LTE uplink the first resolver is the carrier's, and a spoofed answer
+# there is a silent redirect — no listener, no open port, nothing the Open Ports
+# section can see. These two facts are what matter and both are readable
+# without root from `resolvectl`:
+#   DNSSEC=no/unsupported  → answers are not validated, so spoofing works
+#   -DNSOverTLS            → queries are plaintext on the wire, so they are
+#                            readable and rewritable in transit
+DNS_DROPIN_DIR  = "/etc/systemd/resolved.conf.d"
+DNS_DROPIN_PATH = f"{DNS_DROPIN_DIR}/90-secure-dns.conf"
+
+# Two resolvers from different operators: a single upstream is both a
+# correlation point and a single point of failure. The `#name` suffix is what
+# makes systemd-resolved authenticate the TLS certificate; without it DoT
+# still encrypts but no longer proves who answered.
+DNS_DROPIN_TEMPLATE = """\
+# Managed by rex (ÆGIS) {version} — generated DNS hardening.
+# Query privacy belongs here rather than in resolv.conf, which resolved
+# rewrites on every restart.
+[Resolve]
+DNS={servers}
+DNSOverTLS=yes
+# allow-downgrade keeps captive portals usable: on a network that blocks 853
+# resolved falls back to plaintext instead of leaving the host with no DNS.
+# Set DNSSEC=yes to fail closed instead.
+DNSSEC=allow-downgrade
+Cache=yes
+"""
+
+DNS_SECURE_SERVERS = "1.1.1.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net"
+
+# The same two operators over IPv6. `ipv4.dns` rejects a v6 literal (and vice
+# versa), so the two families are set on separate nmcli properties.
+DNS_SECURE_SERVERS_V6 = (
+    "2606:4700:4700::1111#cloudflare-dns.com 2620:fe::fe#dns.quad9.net")
+
+# When NetworkManager owns the link, it pushes per-link resolvers into resolved
+# from DHCP, and those take precedence over a global DNS= for that link. The
+# encrypted resolvers therefore have to be set on the *connection*, and this
+# drop-in keeps only what nmcli has no property for: DNSSEC validation.
+DNS_NM_DROPIN_TEMPLATE = """\
+# Managed by rex (ÆGIS) {version} — generated DNS hardening.
+# NetworkManager owns the resolvers on this host, so the encrypted upstreams
+# are set on the connection itself (see nmcli) and are deliberately absent
+# here: a global DNS= does not replace per-link servers, it is queried
+# alongside them, which would leave the carrier resolver answering in
+# plaintext while this file looked correct.
+[Resolve]
+# allow-downgrade keeps captive portals usable: on a network that blocks 853
+# resolved falls back to plaintext instead of leaving the host with no DNS.
+# Set DNSSEC=yes to fail closed instead.
+DNSSEC=allow-downgrade
+Cache=yes
+"""
+
+
+def _nm_dns_link():
+    """Name of the NetworkManager connection carrying the default route.
+
+    Returns None when nmcli is absent, when NM manages no real interface, or
+    when the name cannot be quoted safely into a shell command — in which case
+    the caller falls back to the global drop-in rather than emitting a command
+    that could be mangled by a crafted connection name.
+    """
+    if IS_WIN or IS_MAC or not shutil.which("nmcli"):
+        return None
+    out = AuditEngine._cmd(
+        ["nmcli", "-t", "-f", "NAME,DEVICE,TYPE", "connection", "show",
+         "--active"], timeout=8)
+    if not out or _probe_failed(out):
+        return None
+    for line in out.splitlines():
+        name, _, rest = line.replace("\\:", "\x00").partition(":")
+        dev, _, ctype = rest.partition(":")
+        name = name.replace("\x00", ":").strip()
+        dev = dev.replace("\x00", ":").strip()
+        ctype = ctype.strip()
+        # A container bridge or a veth pair is not where the host's own
+        # lookups go; picking one would send DNS policy to the wrong link.
+        if not name or not dev or ctype in ("loopback", "bridge"):
+            continue
+        if dev == "lo" or dev.startswith(("docker", "br-", "veth", "virbr")):
+            continue
+        if any(ch in name for ch in '"$`\\\''):
+            return None
+        return name
+    return None
+
+
+def dns_posture() -> dict:
+    """Report whether DNS is encrypted and validated. Never raises."""
+    out = {"available": False, "dot": None, "dnssec": None,
+           "servers": [], "resolv_mode": "", "reasons": []}
+
+    if IS_WIN or IS_MAC:
+        out["reasons"].append("systemd-resolved is Linux-only; check the OS "
+                              "resolver policy instead")
+        return out
+
+    status = AuditEngine._cmd(["resolvectl", "status"], timeout=8)
+    if not status or _probe_failed(status):
+        out["reasons"].append(
+            "resolvectl not available — systemd-resolved is absent, so the "
+            "resolver in use cannot be inspected here")
+        return out
+
+    out["available"] = True
+    global_dot = None
+    link_dot = None
+    section = "global"
+    for line in status.splitlines():
+        s = line.strip()
+        if s == "Global":
+            section = "global"
+            continue
+        if s.startswith("Link "):
+            section = "link"
+            continue
+        if "DNSOverTLS" in s:
+            # DoT can be enabled on the link (the NetworkManager route, where
+            # nmcli sets connection.dns-over-tls) while the Global block still
+            # reads -DNSOverTLS. Reading only the Global line would report a
+            # host that is already encrypted as if nothing had been fixed, so
+            # an encrypted link counts as encrypted.
+            if "+DNSOverTLS" in s:
+                if section == "global":
+                    if global_dot is None:
+                        global_dot = True
+                else:
+                    link_dot = True
+            elif "-DNSOverTLS" in s:
+                if section == "global" and global_dot is None:
+                    global_dot = False
+        m = re.search(r"DNSSEC=(\S+)", s)
+        if m and out["dnssec"] is None:
+            out["dnssec"] = m.group(1)
+        m = re.search(r"resolv\.conf mode:\s*(\S+)", s)
+        if m:
+            out["resolv_mode"] = m.group(1)
+        if s.startswith("DNS Servers:"):
+            parts = s.split(":", 1)[1].split()
+            out["servers"].extend(parts)
+    current = re.search(r"Current DNS Server:\s*(\S+)", status)
+    if current and current.group(1) not in out["servers"]:
+        out["servers"].insert(0, current.group(1))
+
+    seen_dot = True if link_dot else global_dot
+    out["dot"] = seen_dot
+    dnssec = (out["dnssec"] or "").lower()
+    validated = dnssec not in ("", "no/unsupported", "no", "unsupported")
+    out["validated"] = validated
+
+    if seen_dot is False:
+        out["reasons"].append("DNSOverTLS is off — queries leave in plaintext")
+    if not validated:
+        out["reasons"].append(
+            f"DNSSEC={out['dnssec'] or 'unset'} — answers are not validated, "
+            "so a spoofed reply is accepted")
+    # A `#name` in the server list is what turns DoT into authenticated DoT.
+    out["authenticated"] = any("#" in s for s in out["servers"])
+    if seen_dot and not out["authenticated"]:
+        out["reasons"].append(
+            "DoT is on but no resolver carries a #tls-name, so the "
+            "connection is encrypted without being authenticated")
+
+    out["secure"] = bool(seen_dot) and validated
+    return out
+
+
+def _dns_posture_lines(posture: dict) -> list:
+    """Human-readable summary shared by the audit section and harden notes."""
+    if not posture.get("available"):
+        return [f"DNS posture: not assessed — {r}" for r in posture["reasons"]]
+    servers = ", ".join(posture["servers"]) or "(none reported)"
+    lines = [
+        f"DNS posture: {'encrypted + validated' if posture['secure'] else 'INSECURE'}",
+        f"  resolvers: {servers}",
+        f"  DNSOverTLS: {'on' if posture['dot'] else 'off'}"
+        f"   DNSSEC: {posture.get('dnssec') or 'unset'}",
+    ]
+    if posture["reasons"]:
+        lines.append("  " + "\n  ".join(posture["reasons"]))
+        lines.append("  Fix: rex.py --harden dns")
+    return lines
+
+
+# ============================================================
+# HARDENING — deterministic remediation for fail2ban / ClamAV / DNS
 # ============================================================
 # The audit sections above can only *report* that fail2ban is absent, or that
 # ClamAV has no signature refresh and no scan schedule. Handing that text to an
@@ -2723,11 +2925,13 @@ def apply_commands(cmds, on_progress=None, timeout=30,
 # tested on needs one). The exported script uses plain `sudo` because a human
 # is sitting in front of it.
 
-HARDEN_TARGETS = ("fail2ban", "clamav")
+HARDEN_TARGETS = ("fail2ban", "clamav", "dns")
 
 HARDEN_ALIASES = {
     "fail2ban": "fail2ban", "f2b": "fail2ban", "intrusion": "fail2ban",
     "clamav": "clamav", "clam": "clamav", "antivirus": "clamav", "av": "clamav",
+    "dns": "dns", "dot": "dns", "dnssec": "dns", "resolved": "dns",
+    "systemd-resolved": "dns",
 }
 
 # Written to /etc/fail2ban/jail.local — deliberately not jail.conf, so package
@@ -2805,9 +3009,9 @@ def _install_cmd(packages, sudo_prefix):
     return None
 
 
-def _step(command, summary, why="", mutating=True):
+def _step(command, summary, why="", mutating=True, expect_failure=False):
     return {"command": command, "summary": summary, "why": why,
-            "mutating": mutating,
+            "mutating": mutating, "expect_failure": expect_failure,
             "blocked": danger_reason(command) or ""}
 
 
@@ -2926,9 +3130,142 @@ def _harden_clamav(sudo_prefix="sudo -n", target: str = "/home") -> dict:
                       "Inspect results with: journalctl -u rex-clamav-scan"]}
 
 
+def _harden_dns(sudo_prefix="sudo -n") -> dict:
+    """Encrypt and validate DNS through a systemd-resolved drop-in.
+
+    A drop-in under resolved.conf.d/ rather than an edit to resolved.conf, so a
+    package upgrade never reverts it and a hand-written local override still
+    wins by sorting after this file.
+    """
+    if IS_WIN:
+        return {"target": "dns", "supported": False, "steps": [], "notes": [
+            ("Windows DoH is per-interface and registry-driven; set it in "
+             "Settings → Network → DNS encryption, or via the DoH policy in "
+             "gpedit (Computer Configuration → Administrative Templates → "
+             "Network → DNS Client).")]}
+    if IS_MAC:
+        return {"target": "dns", "supported": False, "steps": [], "notes": [
+            ("macOS has no systemd-resolved. Use an encrypted resolver profile "
+             "(e.g. a .mobileconfig installing Cloudflare or Quad9 over DoH), "
+             "which is a per-network setting rex will not overwrite.")]}
+
+    posture = dns_posture()
+    if not posture["available"]:
+        return {"target": "dns", "supported": False, "steps": [], "notes": [
+            ("systemd-resolved is not present, so there is nothing to "
+             "configure here. Install and enable it (systemd-resolved package), "
+             "then re-run `rex.py --harden dns`.")] + posture["reasons"]}
+
+    notes = [
+        f"Current resolvers: {', '.join(posture['servers']) or '(none)'}",
+        f"Current state: DNSOverTLS={'on' if posture['dot'] else 'off'}, "
+        f"DNSSEC={posture.get('dnssec') or 'unset'}",
+        "Upstream becomes Cloudflare + Quad9 over authenticated TLS; the "
+        "carrier/ISP resolver stops being used for lookups.",
+        "DNSSEC=allow-downgrade keeps captive portals working and falls back "
+        "to plaintext DNS on networks that block port 853. Change it to "
+        "DNSSEC=yes in the drop-in to fail closed instead.",
+        "Nothing is lost by having both: a resolver that does not answer is "
+        "retried at the other one.",
+    ]
+
+    nm_link = _nm_dns_link()
+    steps = []
+    if nm_link:
+        # NetworkManager owns the resolvers: a global DNS= would be queried
+        # alongside the DHCP-pushed carrier server (which wins for this link),
+        # leaving traffic in plaintext while the drop-in looked correct. Set
+        # the encrypted resolvers on the connection so NM hands them to
+        # resolved as the per-link servers, and enable DoT per-link.
+        notes.insert(0, f"NetworkManager manages '{nm_link}', so the encrypted "
+                        "resolvers are set on the connection rather than "
+                        "globally: per-link DNS from NM overrides a global DNS=.")
+        notes.insert(1, "nmcli has no DNSSEC property, so validation still "
+                        "comes from the resolved drop-in.")
+        steps.extend([
+            _step(f'{sudo_prefix} nmcli con mod "{nm_link}" '
+                  f'ipv4.dns "{DNS_SECURE_SERVERS}"',
+                  "Point IPv4 resolvers at Cloudflare + Quad9, pinned by TLS name",
+                  "the #tls-name suffix is what makes resolved authenticate the "
+                  "certificate; encryption alone proves nothing about who answered"),
+            _step(f'{sudo_prefix} nmcli con mod "{nm_link}" '
+                  f'ipv6.dns "{DNS_SECURE_SERVERS_V6}"',
+                  "Point IPv6 resolvers at the same two operators",
+                  "a host with a working v6 path would otherwise keep resolving "
+                  "over unencrypted v6 after the v4 change"),
+            _step(f'{sudo_prefix} nmcli con mod "{nm_link}" '
+                  f'ipv4.ignore-auto-dns yes',
+                  "Stop accepting the DHCP-supplied IPv4 resolver",
+                  "otherwise the carrier resolver is pushed back in on the next "
+                  "lease and answered alongside the encrypted ones"),
+            _step(f'{sudo_prefix} nmcli con mod "{nm_link}" '
+                  f'ipv6.ignore-auto-dns yes',
+                  "Stop accepting the DHCP-supplied IPv6 resolver", ""),
+            _step(f'{sudo_prefix} nmcli con mod "{nm_link}" '
+                  f'connection.dns-over-tls yes',
+                  "Require DNS-over-TLS on this connection",
+                  "without this resolved may still talk plaintext to a server "
+                  "that fails the TLS handshake"),
+        ])
+    else:
+        notes.insert(0, "No NetworkManager-managed link found, so the resolvers "
+                        "are set globally in the resolved drop-in.")
+
+    steps.extend([
+        # Creating the directory first matters on a stock Ubuntu: the
+        # resolved.conf.d drop-in directory does not exist, and `tee` into a
+        # missing directory fails before it can write anything.
+        _step(f"{sudo_prefix} mkdir -p {DNS_DROPIN_DIR}",
+              "Create the resolved drop-in directory",
+              "it does not exist on a stock install, so the write would fail"),
+        _write_file_step(
+            DNS_DROPIN_PATH,
+            (DNS_NM_DROPIN_TEMPLATE if nm_link else DNS_DROPIN_TEMPLATE).format(
+                version=VERSION, servers=DNS_SECURE_SERVERS),
+            sudo_prefix,
+            ("Write the DNSSEC policy" if nm_link
+             else "Write the encrypted-DNS policy"),
+            ("nmcli cannot set DNSSEC, so validation is configured here; the "
+             "resolvers themselves live on the connection"
+             if nm_link else
+             "DNSOverTLS=yes encrypts every lookup and pins the "
+             "resolver certificate by TLS name; DNSSEC validates "
+             "the answer itself")),
+    ])
+
+    if nm_link:
+        steps.append(_step(f'{sudo_prefix} nmcli con up "{nm_link}"',
+                           "Apply the connection profile",
+                           "nmcli con mod writes the profile; the running link "
+                           "keeps the old resolvers until it is brought up"))
+
+    steps.extend([
+        _step(f"{sudo_prefix} systemctl restart systemd-resolved",
+              "Apply the policy",
+              "resolved reads its configuration only at startup"),
+        _step("resolvectl status", "Show the resolver now in force", "",
+              mutating=False),
+        # The two probes are the evidence. A query for a deliberately broken
+        # DNSSEC name must fail once validation is real; before this change it
+        # returned NOERROR, which is exactly how an unvalidated resolver looks.
+        _step("resolvectl query dnssec-failed.org",
+              "Verify DNSSEC validation is live (this query must FAIL)",
+              "a resolver that validates cannot return an A record for a "
+              "deliberately broken signature; NOERROR means nothing is checked",
+              mutating=False, expect_failure=True),
+        _step("resolvectl query cloudflare.com",
+              "Verify normal resolution still works", "",
+              mutating=False),
+    ])
+    return {"target": "dns", "supported": True, "steps": steps, "notes": notes,
+            "posture": {k: posture.get(k) for k in
+                        ("dot", "dnssec", "secure", "servers")}}
+
+
 HARDEN_BUILDERS = {
     "fail2ban": _harden_fail2ban,
     "clamav":   _harden_clamav,
+    "dns":      _harden_dns,
 }
 
 
@@ -2977,7 +3314,11 @@ def harden_script(plan: dict) -> str:
     lines = ["#!/bin/sh",
              "# Generated by rex (ÆGIS) — review before running.",
              "# Regenerate with: rex.py --harden-script",
+             "# Stops at the first failing step: without this a step can be",
+             "# skipped and the run still looks like it succeeded, leaving the",
+             "# host half-hardened. Verify steps expected to fail are exempted.",
              "set -u",
+             "set -e",
              ""]
     for t in plan["targets"]:
         if not t["supported"]:
@@ -2990,9 +3331,26 @@ def harden_script(plan: dict) -> str:
         for note in t["notes"]:
             lines.append(f"# {note}")
         lines.append("")
-        for step in t["steps"]:
+        for index, step in enumerate(t["steps"], 1):
             if step["why"]:
                 lines.append(f"# {step['summary']}: {step['why']}")
+            if step.get("expect_failure"):
+                # Without this a human running the script sees a non-zero exit
+                # and assumes the hardening failed, when the failure is proof
+                # that it worked. Guarded so `set -e` does not abort the run.
+                lines.append("# NOTE: a non-zero exit here is the PASS condition.")
+                lines.append("if " + step["command"] + "; then")
+                lines.append(f'    echo "rex: step {index} of {t["target"]} '
+                             'unexpectedly succeeded, so it did not verify anything" >&2')
+                lines.append("    exit 1")
+                lines.append("fi")
+                lines.append("")
+                continue
+            # Every mutating step is prefixed so a failure names the step that
+            # broke: with `set -e` at the top, a rejected command aborts the run
+            # instead of leaving the host silently half-hardened.
+            if step.get("mutating", True):
+                lines.append(f'echo "==> [{index}] {step["summary"]}"')
             lines.append(step["command"])
             lines.append("")
     return "\n".join(lines)
@@ -3152,8 +3510,24 @@ def capabilities() -> dict:
                       "--print-prompt", "--apply", "--yes", "--force", "--json"],
              "emits": SCHEMA_FIX,
              "exit_codes": [EXIT_CLEAN, EXIT_FINDINGS, EXIT_USAGE, EXIT_PROVIDER, EXIT_APPLY]},
+            {"flag": "--harden", "summary": "Deterministic install+harden plan for "
+                                            "fail2ban/clamav/dns (or 'all'). Plans "
+                                            "only; never executes without --apply --yes.",
+             "args": ["TARGET", "--apply", "--yes", "--harden-script",
+                      "--scan-target DIR", "--json"],
+             "emits": SCHEMA_HARDEN,
+             "targets": list(HARDEN_TARGETS),
+             "exit_codes": [EXIT_CLEAN, EXIT_USAGE, EXIT_APPLY]},
+            {"flag": "--harden-script", "summary": "With --harden: emit the plan as a "
+                                                   "reviewable POSIX shell script for a "
+                                                   "human to run under interactive sudo. "
+                                                   "Never executes.",
+             "args": ["--harden TARGET", "--json"],
+             "emits": SCHEMA_HARDEN,
+             "exit_codes": [EXIT_CLEAN, EXIT_USAGE]},
         ],
         "schemas": {"audit": SCHEMA_AUDIT, "fix": SCHEMA_FIX,
+                    "harden": SCHEMA_HARDEN,
                     "capabilities": SCHEMA_CAPABILITIES},
         "exit_codes": {
             str(EXIT_CLEAN):    "success — audit ran (or nothing met an explicit --fail-on threshold)",
@@ -3438,6 +3812,23 @@ def _cli_main(argv) -> int:
                 on_progress=lambda m: None if args.json else print(m, file=sys.stderr),
                 timeout=600,   # apt install + a full signature download
             )
+            # A verification probe may be *supposed* to fail — `resolvectl query
+            # dnssec-failed.org` returning an answer is the broken state. Judge
+            # those steps against their own expectation so a working host does
+            # not report EXIT_APPLY after a fully successful run.
+            expect = {s["command"]: s.get("expect_failure", False)
+                      for s in plan["steps"]}
+            for r in applied:
+                if not r.get("executed") or "exit_code" not in r:
+                    continue
+                if not expect.get(r["command"]):
+                    continue
+                passed = (r["exit_code"] != 0)
+                r["expectation"] = "failure expected; " + (
+                    "met" if passed else "NOT met — the probe succeeded, so the "
+                                         "setting is not in effect")
+                r["ok"] = passed
+            ok = all(r["ok"] for r in applied if r.get("executed"))
             plan["applied"] = True
             plan["apply_results"] = applied
             plan["apply_ok"] = ok

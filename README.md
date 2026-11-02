@@ -54,7 +54,30 @@ python3 rex.py --capabilities   # machine-readable contract: commands, schemas, 
 python3 rex.py --list-checks    # every audit section and its stable id
 python3 rex.py --audit --json
 python3 rex.py --fix ssh-config --provider deepseek --json
+python3 rex.py --harden dns --harden-script   # reviewable: encrypted + validated DNS
 ```
+
+`--harden` plans deterministic remediation for `fail2ban`, `clamav` and `dns`.
+It never executes anything without `--apply --yes`, and `--harden-script`
+exports the same plan as a POSIX shell script for a human to run under a real
+sudo. The `dns` target encrypts and validates name resolution, and it picks the
+mechanism that actually takes effect on the host:
+
+- **NetworkManager owns the link** — the encrypted resolvers are set with
+  `nmcli con mod` on the connection (`ipv4.dns`/`ipv6.dns` pinned by TLS name,
+  `ignore-auto-dns yes`, `connection.dns-over-tls yes`), because NM pushes
+  per-link resolvers from DHCP and those override a global `DNS=` for that
+  link. NM cannot set DNSSEC, so a minified
+  `/etc/systemd/resolved.conf.d/90-secure-dns.conf` still supplies
+  `DNSSEC=allow-downgrade`.
+- **No NM** — a single `/etc/systemd/resolved.conf.d/` drop-in carries
+  `DNSOverTLS=yes`, the pinned resolvers and `DNSSEC=allow-downgrade`.
+
+Either way the plan ends with verification: `resolvectl query
+dnssec-failed.org` is *expected to fail*, because a resolver that validates
+cannot return a record for a deliberately broken signature. That probe is
+marked `expect_failure`, so a host that is correctly fixed is not reported as a
+failed apply.
 
 Start with `--capabilities`. It declares every flag, JSON schema, exit code and
 provider in one document, so a caller never has to scrape `--help` prose.
@@ -154,7 +177,7 @@ $ python3 rex.py --fix ssh-config --provider pollinations --apply --yes
 | System Info | OS, kernel, hostname, uptime |
 | CPU & Memory | load average, RAM/swap usage |
 | Disk | partition usage, mount flags |
-| Network | interfaces, IPs, MAC addresses |
+| Network | interfaces, IPs, MAC addresses, and DNS posture (DNSOverTLS / DNSSEC) |
 | Open Ports | listening TCP/UDP ports and owning processes |
 | Running Processes | top processes by CPU/memory |
 | Startup Services | enabled systemd / launchd / startup items |
