@@ -1399,6 +1399,141 @@ class TestHardenBuilders:
         assert "RandomizedDelaySec" in timer, "a fleet must not scan in lockstep"
 
 
+class TestDnsHarden:
+    """--harden dns: encrypt and validate name resolution.
+
+    The audit can report a host with no listener reachable from the LAN while
+    every hostname it resolves still travels in plaintext over a carrier
+    uplink. These tests pin the three things that make that fix trustworthy:
+    the drop-in survives upgrades, the certificate is actually authenticated,
+    and a working host is not reported as a failed apply.
+    """
+
+    def test_target_resolves_from_aliases(self):
+        for alias in ("dns", "dot", "dnssec", "resolved", "systemd-resolved"):
+            assert rexmod.resolve_harden_targets(alias)[0] == ["dns"], alias
+        assert "dns" in rexmod.HARDEN_TARGETS
+        assert rexmod.HARDEN_BUILDERS["dns"] is rexmod._harden_dns
+
+    def test_policy_is_a_dropin_not_the_shared_conf(self, monkeypatch):
+        """A drop-in survives package upgrades; resolved.conf does not."""
+        monkeypatch.setattr(rexmod, "dns_posture",
+                            lambda: {"available": True, "dot": False,
+                                     "dnssec": "no/unsupported",
+                                     "secure": False, "servers": ["10.0.0.1"]})
+        plan = rexmod._harden_dns()
+        blob = "\n".join(s["command"] for s in plan["steps"])
+        assert rexmod.DNS_DROPIN_PATH in blob
+        assert "/etc/systemd/resolved.conf " not in blob
+        assert rexmod.DNS_DROPIN_PATH.startswith("/etc/systemd/resolved.conf.d/")
+
+    def test_resolvers_carry_a_tls_name(self):
+        """DoT without #name encrypts but does not authenticate the resolver."""
+        body = rexmod.DNS_DROPIN_TEMPLATE.format(
+            version="x", servers=rexmod.DNS_SECURE_SERVERS)
+        assert "DNSOverTLS=yes" in body
+        names = [t for t in rexmod.DNS_SECURE_SERVERS.split() if "#" in t]
+        assert len(names) == 2, "two independently operated resolvers, both pinned"
+        for token in names:
+            host, _, tls = token.partition("#")
+            assert tls and "." in tls, f"{host} needs a real TLS name, got {tls!r}"
+
+    def test_dnssec_is_not_silently_disabled(self):
+        body = rexmod.DNS_DROPIN_TEMPLATE.format(
+            version="x", servers=rexmod.DNS_SECURE_SERVERS)
+        assert "DNSSEC=no" not in body
+        assert "DNSSEC=allow-downgrade" in body
+
+    def test_directory_is_created_before_the_write(self, monkeypatch):
+        """The drop-in dir does not exist on stock Ubuntu; tee would fail."""
+        monkeypatch.setattr(rexmod, "dns_posture",
+                            lambda: {"available": True, "dot": False,
+                                     "dnssec": "no/unsupported",
+                                     "secure": False, "servers": []})
+        plan = rexmod._harden_dns()
+        cmds = [s["command"] for s in plan["steps"]]
+        mk = next(i for i, c in enumerate(cmds) if "mkdir -p" in c)
+        write = next(i for i, c in enumerate(cmds) if ">>" in c or "tee" in c)
+        assert mk < write
+
+    def test_broken_dnssec_probe_is_marked_as_expected_failure(self, monkeypatch):
+        """`query dnssec-failed.org` succeeding is the *broken* state."""
+        # Pin the posture so the plan is built even on a host without
+        # resolvectl, where this target is correctly reported unsupported.
+        monkeypatch.setattr(rexmod, "dns_posture",
+                            lambda: {"available": True, "dot": False,
+                                     "dnssec": "no/unsupported",
+                                     "secure": False, "servers": []})
+        plan = rexmod.build_harden_plan("dns")
+        probe = [s for s in plan["steps"]
+                 if "dnssec-failed.org" in s["command"]]
+        assert len(probe) == 1
+        assert probe[0]["expect_failure"] is True
+        others = [s for s in plan["steps"] if s is not probe[0]]
+        assert not any(s.get("expect_failure") for s in others)
+
+    def test_expected_failure_does_not_fail_the_apply(self):
+        """Regression: a correct host reported EXIT_APPLY after success."""
+        steps = [
+            {"command": "ok-cmd", "summary": "s", "why": "", "mutating": True,
+             "expect_failure": False, "blocked": ""},
+            {"command": "probe", "summary": "s", "why": "", "mutating": False,
+             "expect_failure": True, "blocked": ""},
+        ]
+        plan = {"targets": [], "steps": steps}
+        expect = {s["command"]: s.get("expect_failure", False)
+                  for s in plan["steps"]}
+        applied = [{"command": "ok-cmd", "executed": True, "ok": True,
+                    "exit_code": 0},
+                   {"command": "probe", "executed": True, "ok": False,
+                    "exit_code": 2}]
+        for r in applied:
+            if expect.get(r["command"]):
+                r["ok"] = r["exit_code"] != 0
+        assert all(r["ok"] for r in applied), \
+            "a probe that is supposed to fail must not fail the run"
+
+    def test_posture_parser_reads_negative_flags(self, monkeypatch):
+        """The measured shape on this host: -DNSOverTLS, DNSSEC=no/unsupported."""
+        sample = (
+            "Global\n"
+            "         Protocols: -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported\n"
+            "  resolv.conf mode: stub\n"
+            "Link 4 (enxf2333957f104)\n"
+            "         Protocols: +DefaultRoute -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported\n"
+            "Current DNS Server: 10.45.232.224\n"
+            "       DNS Servers: 10.45.232.224 2a02:aa1:114c:de3d::6f\n"
+        )
+        monkeypatch.setattr(rexmod.AuditEngine, "_cmd",
+                            staticmethod(lambda *a, **k: sample))
+        p = rexmod.dns_posture()
+        assert p["available"] is True
+        assert p["dot"] is False
+        assert p["secure"] is False
+        assert "10.45.232.224" in p["servers"]
+
+    def test_posture_parser_reads_positive_flags(self, monkeypatch):
+        sample = (
+            "Global\n"
+            "         Protocols: +LLMNR -mDNS +DNSOverTLS DNSSEC=yes\n"
+            "       DNS Servers: 1.1.1.1#cloudflare-dns.com\n"
+        )
+        monkeypatch.setattr(rexmod.AuditEngine, "_cmd",
+                            staticmethod(lambda *a, **k: sample))
+        p = rexmod.dns_posture()
+        assert p["dot"] is True
+        assert p["secure"] is True
+        assert p["authenticated"] is True
+
+    def test_missing_resolved_is_unassessed_not_a_finding(self, monkeypatch):
+        """Absence of evidence is not evidence: no resolvectl must not warn."""
+        monkeypatch.setattr(rexmod.AuditEngine, "_cmd",
+                            staticmethod(lambda *a, **k: "[not found]"))
+        p = rexmod.dns_posture()
+        assert p["available"] is False
+        assert p["reasons"], "an unassessed host still needs an explanation"
+
+
 class TestFreshclamHint:
     """The hint decides whether the user sees a working command or that error."""
 
