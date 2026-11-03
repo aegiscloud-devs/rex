@@ -481,6 +481,19 @@ def test_gui_dialog_and_cli_share_one_classifier():
         rexmod.RemediationDialog._clean_commands("1. uptime") == ["uptime"]
 
 
+def test_plan_dialog_is_a_real_dialog_class():
+    """Structural parity check only, matching this file's existing GUI test:
+    no QApplication is started here. PlanDialog's actual content (the plan
+    preview text, manual_followup rendering, apply-button enablement against
+    SecurityAuditWindow's real self.results shape) was verified live with
+    QT_QPA_PLATFORM=offscreen rather than added as a widget-instantiation
+    test, since this repo has no QApplication test fixture yet."""
+    if not rexmod.HAS_QT:
+        pytest.skip("PyQt6 not installed")
+    assert issubclass(rexmod.PlanDialog, rexmod.QDialog)
+    assert hasattr(rexmod.SecurityAuditWindow, "_fix_all")
+
+
 # --------------------------------------------------------------------------
 # redaction path
 # --------------------------------------------------------------------------

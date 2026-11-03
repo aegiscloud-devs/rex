@@ -4589,6 +4589,114 @@ class RemediationDialog(QDialog):
         self.accept()
 
 
+class PlanDialog(QDialog):
+    """GUI front-end for build_plan() — the deterministic counterpart to
+    RemediationDialog. No AI call and no streaming: the plan is already
+    fully known before this dialog opens, so there is nothing to wait on
+    except the human's decision to run it.
+    """
+
+    def __init__(self, parent, plan: dict):
+        super().__init__(parent)
+        self.plan = plan
+        self.applied_output = None
+        self.setWindowTitle("Fix All — deterministic plan")
+        self.resize(760, 560)
+        self.setStyleSheet(f"""
+            QDialog   {{ background:{COLORS['bg2']}; color:{COLORS['text']}; }}
+            QLabel    {{ color:{COLORS['text']}; font-size:12px; }}
+            QTextEdit {{ background:{COLORS['bg3']}; color:{COLORS['text']};
+                         border:1px solid {COLORS['border']}; border-radius:6px;
+                         font-family:'JetBrains Mono','Fira Mono',monospace;
+                         font-size:12px; padding:8px; }}
+            QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
+                           border:1px solid {COLORS['border']}; border-radius:6px;
+                           padding:7px 18px; font-size:12px; }}
+            QPushButton#apply {{ background:{COLORS['cyan']}; color:#04140f;
+                                 font-weight:bold; border:none; }}
+            QPushButton:hover  {{ border-color:{COLORS['cyan']}; color:{COLORS['cyan']}; }}
+            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#04140f; }}
+            QPushButton:disabled {{ color:{COLORS['text3']}; border-color:{COLORS['bg3']}; }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        targets = [t["target"] for t in plan["targets"]]
+        lbl_head = QLabel(
+            f"<b style='color:{COLORS['cyan']}'>{len(plan['steps'])} step(s)</b> "
+            f"across {len(targets)} deterministic target(s): {', '.join(targets) or '—'}"
+        )
+        layout.addWidget(lbl_head)
+
+        preview = QTextEdit()
+        preview.setReadOnly(True)
+        lines = []
+        for t in plan["targets"]:
+            lines.append(f"── {t['target']} (triggered by: {', '.join(t['triggered_by'])}) ──")
+            for step in t["steps"]:
+                lines.append(f"  $ {step['command'].splitlines()[0]}"
+                             + (" …" if "\n" in step["command"] else ""))
+            lines.append("")
+        if plan["manual_followup"]:
+            lines.append("── needs the AI-assisted path instead (no deterministic builder) ──")
+            for m in plan["manual_followup"]:
+                lines.append(f"  {m['severity']:<8} {m['section']}  ->  {m['fix_hint']}")
+        preview.setPlainText("\n".join(lines))
+        layout.addWidget(preview)
+
+        lbl_warn = QLabel("⚠  Every command runs through the same guard --apply --yes "
+                          "uses on the CLI. Review before applying.")
+        lbl_warn.setStyleSheet(f"color:{COLORS['orange']};font-size:11px;")
+        layout.addWidget(lbl_warn)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet(f"color:{COLORS['text2']};font-size:11px;")
+        layout.addWidget(self.lbl_status)
+
+        btn_row = QHBoxLayout()
+        self.btn_apply = QPushButton("▶  Apply All")
+        self.btn_apply.setObjectName("apply")
+        self.btn_apply.setEnabled(bool(plan["steps"]))
+        btn_close = QPushButton("Close")
+        btn_row.addWidget(self.btn_apply)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        self.btn_apply.clicked.connect(self._confirm_and_apply)
+        btn_close.clicked.connect(self.reject)
+
+    def _confirm_and_apply(self):
+        from PyQt6.QtWidgets import QMessageBox
+        n = len(self.plan["steps"])
+        reply = QMessageBox.question(
+            self, "Apply All",
+            f"Run all {n} step(s) now? Some may need sudo and will be skipped "
+            f"(not run as a different user) if a password is required.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.setText("⏳  Running…")
+        self.lbl_status.setText("⏳  Applying plan…")
+        cmds = [s["command"] for s in self.plan["steps"]]
+        self._apply_worker = ApplyWorker(cmds, BLOCKED_PATHS, SUDO_PATHS)
+        self._apply_worker.progress.connect(self._on_progress)
+        self._apply_worker.finished.connect(self._on_done)
+        self._apply_worker.start()
+
+    def _on_progress(self, line: str):
+        self.lbl_status.setText(f"⏳  {line}")
+
+    def _on_done(self, summary: str, output: str):
+        self.applied_output = f"{summary}\n\n{output}"
+        self.accept()
+
+
 # ============================================================
 # HUVUD FÖNSTER
 # ============================================================
@@ -4898,6 +5006,14 @@ class SecurityAuditWindow(QMainWindow):
         sb.addWidget(btn_ai_fix)
         self.btn_ai_fix = btn_ai_fix
 
+        btn_fix_all = QPushButton("⚡  Fix All")
+        btn_fix_all.clicked.connect(self._fix_all)
+        btn_fix_all.setEnabled(False)
+        btn_fix_all.setToolTip("Arrange every fixable finding into one deterministic "
+                               "plan (fail2ban/ClamAV/DNS) — same engine as --plan")
+        sb.addWidget(btn_fix_all)
+        self.btn_fix_all = btn_fix_all
+
         sb.addStretch()
         root.addWidget(sidebar)
 
@@ -5047,6 +5163,7 @@ class SecurityAuditWindow(QMainWindow):
         self.btn_stop.setEnabled(True)
         self.btn_export.setEnabled(False)
         self.btn_ai_fix.setEnabled(False)
+        self.btn_fix_all.setEnabled(False)
         self.lbl_status.setText("Running...")
         self.worker = AuditWorker(AUDIT_SECTIONS)
         self.worker.section_done.connect(self._on_section_done)
@@ -5145,6 +5262,7 @@ class SecurityAuditWindow(QMainWindow):
             self.lbl_status.setText(f"Done — {len(warnings)} warning(s)")
             self.lbl_status.setStyleSheet(f"color:{COLORS['orange']};font-size:10px;")
             self.btn_ai_fix.setEnabled(True)
+            self.btn_fix_all.setEnabled(True)
             self._show_summary(warnings)
         else:
             self.lbl_status.setText("Audit complete — no issues found")
@@ -5279,6 +5397,26 @@ class SecurityAuditWindow(QMainWindow):
                 self._show_output(status, self.results[section][1])
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "AI Fix Error", str(e))
+
+    def _fix_all(self):
+        from PyQt6.QtWidgets import QMessageBox
+        if not self.results:
+            QMessageBox.information(self, "Fix All", "Run an audit first.")
+            return
+        report = build_report(self.results)
+        plan = build_plan(report, scan_target=self.scan_path_input.text().strip() or "/home")
+        if plan["nothing_to_do"]:
+            QMessageBox.information(self, "Fix All",
+                "No fixable finding maps to a deterministic hardening target "
+                "(fail2ban/ClamAV/DNS). Use 🤖 AI Fix on the remaining section(s).")
+            return
+        try:
+            dlg = PlanDialog(self, plan)
+            dlg.exec()
+            if dlg.applied_output:
+                QMessageBox.information(self, "Fix All — result", dlg.applied_output[:4000])
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Fix All Error", str(e))
 
     def _export(self):
         path, _ = QFileDialog.getSaveFileName(
