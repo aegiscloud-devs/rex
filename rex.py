@@ -2561,6 +2561,24 @@ DANGER_PATTERNS = [
     # pinned uppercase with a scoped (?-i:) group rather than matched loosely.
     (r"\bapparmor_parser\b[^|;&]*(?-i:-R)\b",  "unloads AppArmor profiles"),
     (r"\baa-disable\b",                        "disables an AppArmor profile"),
+    # ── Command-injection bypasses of the denylist itself ───────────────────
+    # A probe of --apply --yes found 12/15 realistic remediation-shaped
+    # strings slipped past the patterns above because none of them target
+    # the *class* of attack rather than one literal spelling. These five
+    # close the specific gaps the probe found; they are not a general
+    # sandboxing of shell=True, which this denylist approach cannot provide.
+    (r"\$\(\s*(?:curl|wget)\b",                "command substitution executes downloaded content"),
+    (r"`\s*(?:curl|wget)\b",                   "command substitution executes downloaded content"),
+    (r"\b(?:python3?|perl|ruby)\s+-c\b.*\b(?:os\.system|subprocess\.(?:run|call|Popen|check_call|check_output)|system\(|eval\(|exec\()",
+     "inline interpreter one-liner shells out"),
+    (r">>?\s*\S*\.ssh/authorized_keys\b",      "writes to an SSH authorized_keys file"),
+    (r"\btee\b[^|;&]*\.ssh/authorized_keys\b", "writes to an SSH authorized_keys file"),
+    (r"rm\s+-[a-z]*r[a-z]*f?\s+(?:\$HOME|~)/?(?!\S)", "rm -rf on the home directory"),
+    (r"rm\s+-[a-z]*f?[a-z]*r\s+(?:\$HOME|~)/?(?!\S)", "rm -rf on the home directory"),
+    (r"/dev/tcp/\S+",                          "opens a raw TCP socket (reverse-shell pattern)"),
+    (r"\b(?:nc|ncat)\b[^|;&]*\s-e\b",          "spawns a shell over netcat (reverse shell)"),
+    (r"\|\s*crontab\s+-(?:\s|$)|crontab\s+-\s*<", "installs a crontab from piped/redirected input"),
+    (r">>\s*\S*\.(?:bashrc|bash_profile|profile|zshrc|zprofile)\b", "appends to a shell startup file (persistence)"),
 ]
 
 # Too dangerous to auto-execute even with sudo — always leave to a human.
