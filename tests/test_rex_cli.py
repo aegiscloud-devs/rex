@@ -1538,6 +1538,179 @@ class TestDnsHarden:
         assert p["secure"] is False
         assert "10.45.232.224" in p["servers"]
 
+
+def _finding(id, section, status="ok", output=""):
+    return {"id": id, "section": section, "status": status,
+            "severity": rexmod.SEVERITY_BY_STATUS.get(status, "unknown"),
+            "fixable": status in rexmod.FIXABLE_STATUSES, "output": output}
+
+
+class TestBuildPlan:
+    """build_plan(): maps audit findings onto --harden's deterministic builders.
+
+    Pure and read-only, like build_harden_plan — these are unit tests against
+    synthetic reports rather than a real audit, so they pin the mapping logic
+    (and its deliberate gaps) regardless of what this host's own audit finds.
+    """
+
+    def test_fail2ban_finding_pulls_in_the_fail2ban_target(self):
+        report = {"findings": [
+            _finding("intrusion-prevention-fail2ban",
+                     "Intrusion Prevention (fail2ban)", "warn"),
+        ]}
+        plan = rexmod.build_plan(report)
+        assert [t["target"] for t in plan["targets"]] == ["fail2ban"]
+        assert plan["targets"][0]["triggered_by"] == ["intrusion-prevention-fail2ban"]
+        assert plan["manual_followup"] == []
+        assert plan["nothing_to_do"] is False
+
+    def test_clamav_finding_pulls_in_the_clamav_target(self):
+        report = {"findings": [
+            _finding("virus-scan-clamav", rexmod.VIRUS_SECTION, "warn"),
+        ]}
+        plan = rexmod.build_plan(report)
+        assert [t["target"] for t in plan["targets"]] == ["clamav"]
+
+    def test_network_warning_without_the_dns_marker_is_not_a_dns_target(self):
+        """Network's warn condition is DNS-only today, but build_plan must not
+        assume that will always hold — it gates on the marker text, not status."""
+        report = {"findings": [
+            _finding("network", "Network", "warn", output="some other problem"),
+        ]}
+        plan = rexmod.build_plan(report)
+        assert plan["targets"] == []
+        assert plan["manual_followup"][0]["id"] == "network"
+
+    def test_network_warning_with_the_dns_marker_is_a_dns_target(self):
+        report = {"findings": [
+            _finding("network", "Network", "warn",
+                     output="DNS posture: INSECURE\n  resolvers: 10.0.0.1"),
+        ]}
+        plan = rexmod.build_plan(report)
+        assert [t["target"] for t in plan["targets"]] == ["dns"]
+        assert plan["targets"][0]["triggered_by"] == ["network"]
+
+    def test_targets_are_ordered_like_harden_all_not_audit_order(self):
+        """Network (audit index 3) and fail2ban (index 8) must still come out
+        fail2ban-before-dns — the canonical HARDEN_TARGETS order, not the
+        order their sections appear in the audit."""
+        report = {"findings": [
+            _finding("network", "Network", "warn", output="DNS posture: INSECURE"),
+            _finding("intrusion-prevention-fail2ban",
+                     "Intrusion Prevention (fail2ban)", "warn"),
+        ]}
+        plan = rexmod.build_plan(report)
+        assert [t["target"] for t in plan["targets"]] == ["fail2ban", "dns"]
+
+    def test_unfixable_finding_with_no_builder_is_manual_followup_not_dropped(self):
+        report = {"findings": [
+            _finding("ssh-config", "SSH Config", "warn", output="PermitRootLogin yes"),
+        ]}
+        plan = rexmod.build_plan(report)
+        assert plan["targets"] == []
+        assert plan["steps"] == []
+        assert plan["manual_followup"] == [{
+            "id": "ssh-config", "section": "SSH Config", "severity": "medium",
+            "fix_hint": "rex.py --fix 'SSH Config'",
+        }]
+
+    def test_clean_report_yields_nothing_to_do(self):
+        report = {"findings": [_finding("cpu-memory", "CPU & Memory", "ok")]}
+        plan = rexmod.build_plan(report)
+        assert plan["nothing_to_do"] is True
+        assert plan["targets"] == [] and plan["manual_followup"] == []
+
+    def test_info_status_is_not_fixable_and_is_ignored(self):
+        report = {"findings": [_finding("system-info", "System Info", "info")]}
+        plan = rexmod.build_plan(report)
+        assert plan["nothing_to_do"] is True
+
+    def test_steps_are_flattened_across_targets(self):
+        report = {"findings": [
+            _finding("intrusion-prevention-fail2ban",
+                     "Intrusion Prevention (fail2ban)", "warn"),
+            _finding("virus-scan-clamav", rexmod.VIRUS_SECTION, "critical"),
+        ]}
+        plan = rexmod.build_plan(report)
+        assert plan["steps"] == [s for t in plan["targets"] for s in t["steps"]]
+        assert plan["steps"], "two deterministic targets must produce real steps"
+
+    def test_schema_and_identity_match_build_harden_plan(self):
+        report = {"findings": [
+            _finding("intrusion-prevention-fail2ban",
+                     "Intrusion Prevention (fail2ban)", "warn"),
+        ]}
+        plan = rexmod.build_plan(report)
+        assert plan["schema"] == rexmod.SCHEMA_PLAN
+        assert plan["version"] == VERSION
+        assert plan["targets"][0] == {
+            **rexmod._harden_fail2ban(),
+            "triggered_by": ["intrusion-prevention-fail2ban"],
+        }
+
+
+class TestPlanCli:
+    """`rex.py --plan` plans across every fixable finding; it does not execute."""
+
+    def test_json_exits_zero_and_emits_schema(self, audit, tmp_path):
+        _, report = audit
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(report))
+        p, doc = run_json("--plan", "--report", str(report_path), "--json")
+        assert p.returncode == 0, p.stderr
+        assert doc["schema"] == rexmod.SCHEMA_PLAN
+        assert doc["version"] == VERSION
+        assert doc["applied"] is False
+
+    def test_planning_never_executes(self, audit, tmp_path):
+        _, report = audit
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(report))
+        p, doc = run_json("--plan", "--report", str(report_path), "--json")
+        assert p.returncode == 0
+        assert "apply_results" not in doc
+        for step in doc["steps"]:
+            assert "executed" not in step, "planning executed a step"
+
+    def test_bad_report_path_exits_usage(self):
+        p = run("--plan", "--report", "/nonexistent/report.json")
+        assert p.returncode == rexmod.EXIT_USAGE
+
+    def test_manual_followup_entries_are_pasteable_fix_commands(self, audit, tmp_path):
+        _, report = audit
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(report))
+        _, doc = run_json("--plan", "--report", str(report_path), "--json")
+        for m in doc["manual_followup"]:
+            assert m["fix_hint"].startswith("rex.py --fix ")
+            assert m["id"] and m["section"]
+
+    def test_dry_run_apply_without_yes_changes_nothing(self, monkeypatch, tmp_path):
+        report = {"findings": [
+            {"id": "intrusion-prevention-fail2ban",
+             "section": "Intrusion Prevention (fail2ban)", "status": "warn",
+             "severity": "medium", "fixable": True, "output": ""},
+        ]}
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(report))
+        p, doc = run_json("--plan", "--report", str(report_path),
+                          "--apply", "--json")
+        assert p.returncode == 0
+        assert doc["applied"] is False
+        assert doc["dry_run"] is True
+        assert "apply_results" not in doc
+
+    def test_nothing_to_do_exits_clean(self, tmp_path):
+        report = {"findings": [
+            {"id": "cpu-memory", "section": "CPU & Memory", "status": "ok",
+             "severity": "none", "fixable": False, "output": ""},
+        ]}
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(report))
+        p, doc = run_json("--plan", "--report", str(report_path), "--json")
+        assert p.returncode == rexmod.EXIT_CLEAN
+        assert doc["nothing_to_do"] is True
+
     def test_posture_parser_reads_positive_flags(self, monkeypatch):
         sample = (
             "Global\n"

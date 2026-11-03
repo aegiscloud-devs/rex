@@ -3374,6 +3374,65 @@ def harden_script(plan: dict) -> str:
     return "\n".join(lines)
 
 
+# Audit sections whose finding maps 1:1 onto a HARDEN_BUILDERS target. Network
+# is deliberately absent here — its only warn condition today is an insecure
+# DNS posture (see the `dns_posture()` call in AuditEngine's Network branch),
+# but that is carried in free text rather than a structured field, so
+# build_plan gates on the same marker string the audit itself prints instead
+# of trusting status alone: a second, unrelated warn condition added to
+# Network later must not silently trigger a DNS harden.
+SECTION_HARDEN_TARGETS = {
+    "Intrusion Prevention (fail2ban)": "fail2ban",
+    VIRUS_SECTION:                     "clamav",
+}
+NETWORK_DNS_MARKER = "DNS posture: INSECURE"
+
+
+def build_plan(report: dict, sudo_prefix="sudo -n", scan_target="/home") -> dict:
+    """Map an audit report's fixable findings onto deterministic harden steps.
+
+    Pure and read-only like build_harden_plan, which it reuses per target —
+    this only decides *which* targets a given audit implies and in what
+    order. A fixable finding with no deterministic builder (every section
+    outside fail2ban/ClamAV/DNS) is listed in `manual_followup` instead of
+    silently dropped, pointing at the per-section AI-assisted `--fix` path.
+    """
+    triggered: dict = {}
+    manual = []
+    for f in report.get("findings", []):
+        if not f.get("fixable"):
+            continue
+        section = f.get("section")
+        target = SECTION_HARDEN_TARGETS.get(section)
+        if section == "Network" and NETWORK_DNS_MARKER in (f.get("output") or ""):
+            target = "dns"
+        if target and target in HARDEN_BUILDERS:
+            triggered.setdefault(target, []).append(f["id"])
+        else:
+            manual.append({"id": f["id"], "section": section,
+                           "severity": f.get("severity"),
+                           "fix_hint": f"rex.py --fix {section!r}"})
+
+    # Canonical HARDEN_TARGETS order, not audit-section order: the plan must
+    # read the same as `--harden all`, since the CLI, the GUI card and the web
+    # dashboard all render this one document (see SCHEMA_PLAN below).
+    plans = []
+    for target in HARDEN_TARGETS:
+        if target not in triggered:
+            continue
+        builder = HARDEN_BUILDERS[target]
+        plan = (builder(sudo_prefix=sudo_prefix, target=scan_target)
+                if target == "clamav" else builder(sudo_prefix=sudo_prefix))
+        plan["triggered_by"] = triggered[target]
+        plans.append(plan)
+
+    return {"schema": SCHEMA_PLAN, "tool": APP_NAME, "version": VERSION,
+            "platform": _OS, "audit_timestamp": report.get("timestamp"),
+            "targets": plans, "steps": [s for p in plans for s in p["steps"]],
+            "manual_followup": manual,
+            "nothing_to_do": not plans and not manual}
+
+
 # ============================================================
 # MACHINE CONTRACT
 # ============================================================
@@ -3382,6 +3441,10 @@ SCHEMA_AUDIT        = "aegis.rex.audit/1"
 SCHEMA_FIX          = "aegis.rex.fix/1"
 SCHEMA_CAPABILITIES = "aegis.rex.capabilities/1"
 SCHEMA_HARDEN       = "aegis.rex.harden/1"
+# One document that *arranges* the fixes an audit implies. Same shape for the
+# CLI, the GUI card and the web dashboard, so all three front-ends show the
+# same order and the same command text.
+SCHEMA_PLAN         = "aegis.rex.plan/1"
 
 EXIT_CLEAN    = 0   # audit ran, nothing at or above the --fail-on threshold
 EXIT_FINDINGS = 1   # audit ran, findings at or above the threshold
@@ -3543,9 +3606,19 @@ def capabilities() -> dict:
              "args": ["--harden TARGET", "--json"],
              "emits": SCHEMA_HARDEN,
              "exit_codes": [EXIT_CLEAN, EXIT_USAGE]},
+            {"flag": "--plan", "summary": "Audit (or reuse --report), then arrange every "
+                                          "fixable finding that maps onto a --harden "
+                                          "target into one ordered plan; findings with "
+                                          "no deterministic builder are listed under "
+                                          "manual_followup instead of dropped. Plans "
+                                          "only; never executes without --apply --yes.",
+             "args": ["--report FILE", "--apply", "--yes", "--scan-target DIR", "--json"],
+             "emits": SCHEMA_PLAN,
+             "targets": list(HARDEN_TARGETS),
+             "exit_codes": [EXIT_CLEAN, EXIT_USAGE, EXIT_APPLY]},
         ],
         "schemas": {"audit": SCHEMA_AUDIT, "fix": SCHEMA_FIX,
-                    "harden": SCHEMA_HARDEN,
+                    "harden": SCHEMA_HARDEN, "plan": SCHEMA_PLAN,
                     "capabilities": SCHEMA_CAPABILITIES},
         "exit_codes": {
             str(EXIT_CLEAN):    "success — audit ran (or nothing met an explicit --fail-on threshold)",
@@ -3728,6 +3801,11 @@ def _build_argparser():
     p.add_argument("--harden-script", action="store_true",
                    help="with --harden: emit a reviewable shell script for a "
                         "human to run under a real sudo")
+    p.add_argument("--plan", action="store_true",
+                   help="audit (or reuse --report), then arrange every "
+                        "deterministically-fixable finding into one ordered "
+                        "plan via --harden's builders; never runs anything "
+                        "unless --apply --yes is also given")
     p.add_argument("--scan-target", metavar="DIR", default="/home",
                    help="directory the scheduled ClamAV timer scans "
                         "(default: /home)")
@@ -3885,7 +3963,7 @@ def _cli_main(argv) -> int:
         _emit(plan, args.json, "\n".join(lines))
         return EXIT_CLEAN
 
-    if not (args.audit or args.fix):
+    if not (args.audit or args.fix or args.plan):
         print("Nothing to do. Try --audit, --fix, --capabilities, or run without "
               "arguments for the GUI.", file=sys.stderr)
         return EXIT_USAGE
@@ -3909,6 +3987,105 @@ def _cli_main(argv) -> int:
     # path as "no target was requested", which is what keeps the long recursive
     # ClamAV walk out of a routine audit. See AuditEngine.__init__.
     scan_path = args.scan_path
+
+    # ── plan ─────────────────────────────────────────────────
+    # Placed after section/scan_path resolution (needed for the no---report
+    # live-audit branch below) but before --audit/--fix, which --plan does
+    # not require and must not be forced to pass alongside it.
+    if args.plan:
+        if args.report:
+            try:
+                with open(args.report, encoding="utf-8") as f:
+                    audit_doc = json.load(f)
+            except (OSError, ValueError) as e:
+                print(f"could not read report {args.report}: {e}", file=sys.stderr)
+                return EXIT_USAGE
+        else:
+            engine = AuditEngine(sections, scan_path=scan_path)
+            plan_results = (engine.collect(progress=None) if args.sequential
+                            else engine.collect_parallel())
+            audit_doc = build_report(plan_results,
+                                     scan_path=scan_path or os.path.expanduser("~"))
+
+        plan = build_plan(audit_doc, sudo_prefix="sudo -n",
+                          scan_target=args.scan_target)
+
+        if plan["nothing_to_do"]:
+            plan["applied"] = False
+            _emit(plan, args.json,
+                  "Nothing to plan — no fixable finding maps to a "
+                  "deterministic hardening target.")
+            return EXIT_CLEAN
+
+        blocked = [s for s in plan["steps"] if s["blocked"]]
+
+        if args.apply:
+            if not args.yes:
+                plan["applied"] = False
+                plan["dry_run"] = True
+                _emit(plan, args.json,
+                      f"Dry run — {len(plan['steps'])} step(s) planned across "
+                      f"{len(plan['targets'])} target(s), "
+                      f"{len(plan['manual_followup'])} finding(s) need --fix "
+                      f"instead. Re-run with --apply --yes to execute.")
+                return EXIT_CLEAN
+            if blocked:
+                plan["applied"] = False
+                plan["error"] = "plan contains blocked commands"
+                _emit(plan, args.json,
+                      "Refusing to apply — the plan contains blocked command(s).")
+                return EXIT_USAGE
+            ok, applied = apply_commands(
+                [s["command"] for s in plan["steps"]],
+                on_progress=lambda m: None if args.json else print(m, file=sys.stderr),
+                timeout=600,
+            )
+            # Same expect_failure handling as --harden --apply: a DNS probe
+            # step's PASS condition is a non-zero exit, so judging every step
+            # by a flat `exit_code == 0` would report EXIT_APPLY on a host that
+            # fully succeeded.
+            expect = {s["command"]: s.get("expect_failure", False)
+                      for s in plan["steps"]}
+            for r in applied:
+                if not r.get("executed") or "exit_code" not in r:
+                    continue
+                if not expect.get(r["command"]):
+                    continue
+                passed = (r["exit_code"] != 0)
+                r["expectation"] = "failure expected; " + (
+                    "met" if passed else "NOT met — the probe succeeded, so the "
+                                         "setting is not in effect")
+                r["ok"] = passed
+            ok = all(r["ok"] for r in applied if r.get("executed"))
+            plan["apply_results"] = applied
+            manual_sudo = [r for r in applied if r.get("needs_manual_sudo")]
+            plan["needs_manual_sudo"] = [r["needs_manual_sudo"] for r in manual_sudo]
+            if manual_sudo:
+                plan["apply_summary"] = (
+                    "sudo needs a password on this host — nothing was changed. "
+                    "Re-run the equivalent `--harden <target> --harden-script` "
+                    "for each target below and run that under a real sudo.")
+            else:
+                plan["apply_summary"] = ("all steps succeeded" if ok
+                                         else "some steps failed")
+            plan["applied"] = ok
+            _emit(plan, args.json, plan["apply_summary"])
+            return EXIT_CLEAN if ok else EXIT_APPLY
+
+        plan["applied"] = False
+        lines = [f"plan: {len(plan['steps'])} step(s) across "
+                 f"{len(plan['targets'])} deterministic target(s)"]
+        for t in plan["targets"]:
+            lines.append(f"  {t['target']} — {len(t['steps'])} step(s), "
+                         f"triggered by {', '.join(t['triggered_by'])}")
+        if plan["manual_followup"]:
+            lines.append(f"  {len(plan['manual_followup'])} finding(s) need the "
+                         f"AI-assisted path instead (no deterministic builder):")
+            for m in plan["manual_followup"]:
+                lines.append(f"    {m['severity']:<8} {m['id']:<28} -> {m['fix_hint']}")
+        lines.append("Re-run with --apply --yes to execute the deterministic steps.")
+        _emit(plan, args.json, "\n".join(lines))
+        return EXIT_CLEAN
 
     # ── audit ────────────────────────────────────────────────
     results = None
