@@ -4073,8 +4073,8 @@ def _cli_main(argv) -> int:
             return EXIT_CLEAN if ok else EXIT_APPLY
 
         plan["applied"] = False
-        lines = [f"plan: {len(plan['steps'])} step(s) across "
-                 f"{len(plan['targets'])} deterministic target(s)"]
+        lines = [(f"plan: {len(plan['steps'])} step(s) across "
+                  f"{len(plan['targets'])} deterministic target(s)")]
         for t in plan["targets"]:
             lines.append(f"  {t['target']} — {len(t['steps'])} step(s), "
                          f"triggered by {', '.join(t['triggered_by'])}")
