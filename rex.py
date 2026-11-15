@@ -241,7 +241,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.0"
+VERSION  = "1.9.1"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -265,6 +265,23 @@ _CMD_FAILED = re.compile(r"^\[(?:timeout|not found|error[:/]?.*)\]$", re.IGNOREC
 _SUDO_REFUSED = re.compile(
     r"(?:password is required|no tty present|no askpass|a terminal is required|"
     r"is not in the sudoers file|not allowed to execute)",
+    re.IGNORECASE,
+)
+
+# sudo(8) failing before it ever looks at the rule set: a broken binary, bad
+# ownership on its own config, or a container with no way to escalate. The
+# probe produced no rules and no refusal, so the section cannot claim "ok" --
+# it learned nothing. Observed on this host:
+#   sudo: /etc/sudo.conf is owned by uid 65534, should be 0
+#   sudo: The "no new privileges" flag is set, which prevents sudo from
+#         running as root.
+# Before this, that scored "ok" and published a green Sudo section for a host
+# where sudo does not work at all -- a false negative, the mirror image of the
+# refusal-into-a-finding bug this section was rewritten to fix.
+_SUDO_BROKEN = re.compile(
+    r"(?:is owned by uid|should be 0|no new privileges|prevents sudo from "
+    r"running|incorrect permissions|sudo: error|sudo: fatal|unable to "
+    r"resolve host|command not found|no valid sudoers)",
     re.IGNORECASE,
 )
 
@@ -1544,8 +1561,33 @@ class AuditEngine:
                         "as root (or with a cached sudo timestamp) for the real "
                         "rule set."
                     )
+                # sudo failed before reading any rule: unassessed, not clean.
+                # "ok" here would assert the host is clean on the strength of
+                # a probe that never ran -- the same false negative as
+                # reporting a refusal as a finding, just quieter. "info" and
+                # not "error": a broken probe is not a defect to remediate,
+                # and "error" is in FIXABLE_STATUSES, which would hand the
+                # model a "fix this" prompt for a host that has nothing to fix.
+                if _SUDO_BROKEN.search(out or ""):
+                    return "info", (
+                        "sudo is not usable on this host, so its rules could "
+                        "not be assessed.\n"
+                        f"Probe output: {out.strip()}\n"
+                        "This is a broken probe, not a clean rule set: NOPASSWD "
+                        "entries are UNASSESSED here, not absent."
+                    )
                 grants, risky = classify_sudo_output(out)
                 if not grants:
+                    # Only reachable on a probe that actually answered. A rule
+                    # list with no NOPASSWD clause is a real, verified "ok";
+                    # output that never parsed as a rule list is not.
+                    if not re.search(r"may run the following commands",
+                                     out or "", re.IGNORECASE):
+                        return "info", (
+                            "`sudo -n -l` produced output that is not a rule "
+                            "list, so the sudo policy was not assessed.\n"
+                            f"Probe output: {(out or '').strip() or 'no output'}"
+                        )
                     return "ok", out
                 summary = ["=== NOPASSWD grants ==="]
                 for spec, risk, why in grants:
@@ -2532,7 +2574,15 @@ DANGER_PATTERNS = [
     (r">\s*/etc/(?:passwd|shadow|sudoers|crontab|hosts)(?:\s|$)", "overwrites critical config"),
     # Any download piped straight into a shell — not just the "-O -" spelling.
     # `wget -qO- url | bash` is the same attack as `curl url | sh`.
-    (r"(?:wget|curl)\b[^|]*\|\s*(?:ba|z|da|k)?sh\b", "remote code execution via pipe"),
+    # The privileged prefixes matter: `curl url | sudo sh` is the same attack
+    # one `sudo` later, and it scored an empty reason until 1.9.1. The leading
+    # (?:\S*/)? also covers `/usr/bin/bash` and other absolute spellings.
+    (r"(?:wget|curl)\b[^|]*\|\s*(?:(?:sudo|doas|env)\s+(?:-\S+\s+)*)*(?:\S*/)?(?:ba|z|da|k)?sh\b",
+     "remote code execution via pipe"),
+    # Piping a download into an interpreter is the same attack with a different
+    # sink — `wget -qO- url | python3` runs attacker code as surely as `| sh`.
+    (r"(?:wget|curl)\b[^|]*\|\s*(?:(?:sudo|doas|env)\s+(?:-\S+\s+)*)*(?:\S*/)?(?:python[0-9.]*|perl|ruby|node|php[0-9.]*)\b",
+     "remote code execution via pipe"),
     (r"base64\s+.*\|\s*(?:ba)?sh\b", "obfuscated remote execution"),
     (r"!!!", "invalid sudoers syntax"),
     # ── Firewall / MAC teardown ───────────────────────────────────────────
@@ -2554,13 +2604,39 @@ DANGER_PATTERNS = [
     (r"\bnft\b[^|;&]*\b(?:flush|delete)\b", "deletes firewall rules"),
     (r"\bsystemctl\b[^|;&]*\b(?:stop|disable|mask)\b[^|;&]*\b(?:ufw|firewalld|nftables|iptables)\b",
      "stops the firewall service"),
+    # systemctl is not the only route to the same unit. The SysV wrapper and
+    # the Debian init-script runner stop it just as dead, and `iptables -F` is
+    # spelled `ip6tables -F` / `iptables-legacy -F` by the -save/-restore
+    # wrappers. Measured on 1.9.0: every shape below was executable under
+    # --apply, though `iptables-legacy -F` happened to be caught already.
+    (r"\b(?:service|invoke-rc\.d)\s+(?:ufw|firewalld|nftables|iptables|apparmor)\s+(?:stop|disable)\b",
+     "stops the firewall service"),
+    (r"\bip6?tables(?:-legacy|-nft)?\b[^|;&]*\s(?:-F|--flush)\b",
+     "flushes firewall rules"),
+    (r"\bip6?tables(?:-legacy|-nft)?\b[^|;&]*\s(?:-X|--delete-chain)\b",
+     "deletes firewall chains"),
+    (r"\bip6?tables(?:-legacy|-nft)?\b[^|;&]*\s-P\s+\S+\s+ACCEPT\b",
+     "opens the default firewall policy"),
+    # Replaces the entire ruleset from stdin — the wipe vector that `-F` and
+    # `-X` are only the small forms of. `iptables-save` (the backup) stays
+    # allowed; only the restore direction is an attack.
+    (r"\bip6?tables(?:-legacy|-nft)?-restore\b", "replaces the whole firewall ruleset"),
+    # `ufw disable` writes ENABLED=no, but so does sed — and sed never touches
+    # the unit, so the service rule above cannot see it. Treated like the other
+    # sensitive paths: mentioned is blocked, because that file exists for no
+    # purpose but to hold the enabled state the teardown flips.
+    (r"/etc/ufw/ufw\.conf\b|\bufw\.conf\b", "edits the firewall configuration behind ufw's back"),
     (r"\bsetenforce\b[^|;&]*\b0\b",            "disables SELinux enforcement"),
     # AppArmor: `apparmor_parser -R` unloads a profile while `-r` merely
     # replaces/refreshes it (the hardening action). danger_reason searches
     # case-insensitively, which cannot tell the two apart, so the flag is
     # pinned uppercase with a scoped (?-i:) group rather than matched loosely.
     (r"\bapparmor_parser\b[^|;&]*(?-i:-R)\b",  "unloads AppArmor profiles"),
-    (r"\baa-disable\b",                        "disables an AppArmor profile"),
+    # aa-complain downgrades a profile from enforce to complain — the profile
+    # still exists, so a "is AppArmor enforcing?" check still passes, which is
+    # what makes it a quieter teardown than aa-disable. aa-enforce, the fix,
+    # stays allowed.
+    (r"\baa-(?:disable|complain)\b",            "downgrades or disables an AppArmor profile"),
     # ── Command-injection bypasses of the denylist itself ───────────────────
     # A probe of --apply --yes found 12/15 realistic remediation-shaped
     # strings slipped past the patterns above because none of them target
