@@ -243,7 +243,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.3"
+VERSION  = "1.9.4"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -817,6 +817,67 @@ SIGNATURE_SOURCE_HEURISTIC = "heuristic"
 # named here — never the inverse (an allow-list of what's safe to act on,
 # not a block-list of what to exclude).
 NO_REMEDIATION_SIGNATURE_SOURCES = (SIGNATURE_SOURCE_FEED, SIGNATURE_SOURCE_HEURISTIC)
+
+# PLAN.md Phase 7 — consume the signature feed during a scan.
+FEED_ENDPOINT = "https://aegiscloud.org/api/rex/signatures.hdb"
+# A scheduled `rex --audit` must not hit the endpoint on every run — that
+# would make rex a beacon and would contradict the anonymity contract. 24h
+# is long enough that a weekly scheduled scan still refreshes several times
+# a week, short enough that a newly-confirmed hash reaches a daily user soon.
+FEED_CACHE_MAX_AGE = 24 * 60 * 60
+
+
+def _feed_cache_dir():
+    xdg = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache")
+    d = os.path.join(xdg, "rex")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _fetch_extra_signatures(cache_dir=None, *, timeout=10):
+    """Fetch the AEGIS confirmed-malware hash feed and cache it at
+    <cache_dir>/signatures.hdb.
+
+    Returns (path, status) where status is "fresh" (cache under
+    FEED_CACHE_MAX_AGE old, reused — no network call at all), "refetched"
+    (no cache, or a stale one, so it fetched now), or "unavailable" (no
+    cache and the fetch failed). path is None exactly when status is
+    "unavailable" — on failure this deliberately does NOT fall back to a
+    stale cached file; the caller continues with local signatures only
+    rather than risk calling a half-trusted feed file "the feed".
+
+    No cryptographic verification is added here: the real risk this plan
+    defends against is bad data entering the database behind this endpoint
+    (PLAN.md Phases 1-3's review/publish/revoke gates), not the transport
+    of the resulting file, which TLS already protects. Don't "fix" this by
+    bolting on a signature scheme — it would protect against a threat this
+    design doesn't have.
+
+    Never raises: any exception here must not fail a scan. The scan this
+    feeds into must degrade to local-only signatures, loudly (feed_status
+    in the report), not silently.
+    """
+    cache_dir = cache_dir or _feed_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "signatures.hdb")
+    try:
+        age = time.time() - os.path.getmtime(path)
+        if age < FEED_CACHE_MAX_AGE:
+            return path, "fresh"
+    except OSError:
+        pass  # no cache yet — fall through to fetch
+
+    try:
+        with urllib.request.urlopen(FEED_ENDPOINT, timeout=timeout) as resp:
+            body = resp.read()
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+        return path, "refetched"
+    except Exception:  # noqa: BLE001
+        return None, "unavailable"
 
 # Sections that cannot be assessed at all without psutil — keep in sync with
 # the `if psutil is None` guards in _run_section.
@@ -2187,19 +2248,47 @@ class AuditEngine:
                         f"Scanning {files_scanned} files… {short}", files_scanned
                     )
                 proc.wait()
-                if threats:
-                    # PLAN.md Phase 10: every threat line this scan reports is
-                    # today exclusively SIGNATURE_SOURCE_LOCAL — there is no
-                    # other source yet (Phase 7 is what introduces one). The
-                    # tag travels in the text itself because findings in this
-                    # tool are one dict per SECTION (build_report()), not one
-                    # per threat line — this is the channel that actually
-                    # reaches the JSON report today.
-                    tagged = [f"[{SIGNATURE_SOURCE_LOCAL}] {t}" for t in threats]
-                    summary = f"⚠  {len(threats)} THREAT(S) FOUND\n\n" + "\n".join(tagged)
+
+                # PLAN.md Phase 7: a second pass over the same tree, scoped
+                # to ONLY the feed's confirmed-hash database via clamscan's
+                # -d — clamscan only (clamdscan's database is daemon-owned
+                # and takes no per-invocation -d; the Windows/macOS scanner
+                # paths in this file take no database argument at all).
+                # A fetch failure must never fail this scan: feed_status
+                # records what happened so the user can see it, rather than
+                # believing they're feed-covered when they aren't.
+                feed_threats = []
+                feed_path, feed_status = _fetch_extra_signatures()
+                feed_scanner = shutil.which("clamscan")
+                if IS_WIN and not feed_scanner:
+                    win_clamscan = r"C:\Program Files\ClamAV\clamscan.exe"
+                    if os.path.exists(win_clamscan):
+                        feed_scanner = win_clamscan
+                if feed_path and feed_scanner:
+                    feed_out = self._cmd(
+                        [feed_scanner, "-d", feed_path, "--recursive",
+                         "--stdout", "--no-summary", scan_path],
+                        timeout=600,
+                    )
+                    for line in feed_out.splitlines():
+                        line = line.strip()
+                        if line and "FOUND" in line:
+                            feed_threats.append(line)
+
+                # PLAN.md Phase 10: the tag travels in the text itself
+                # because findings in this tool are one dict per SECTION
+                # (build_report()), not one per threat line — this is the
+                # channel that actually reaches the JSON report today.
+                tagged = ([f"[{SIGNATURE_SOURCE_LOCAL}] {t}" for t in threats]
+                          + [f"[{SIGNATURE_SOURCE_FEED}] {t}" for t in feed_threats])
+                if tagged:
+                    summary = (f"⚠  {len(tagged)} THREAT(S) FOUND\n\n"
+                               + "\n".join(tagged)
+                               + f"\n\n[feed_status:{feed_status}]")
                     return "critical", summary
                 return "ok", (f"✓ Clean — {files_scanned} files scanned\n"
-                              f"Engine: {tool}\nPath: {scan_path}")
+                              f"Engine: {tool}\nPath: {scan_path}\n"
+                              f"[feed_status:{feed_status}]")
             except Exception as e:  # noqa: BLE001
                 return "error", str(e)
 
@@ -3699,6 +3788,15 @@ def build_report(results: dict, scan_path: str | None = None, include_output: bo
             "output":     (REDACTED_SENSITIVE
                            if is_redacted else (output if include_output else None)),
         }
+        if section == VIRUS_SECTION:
+            # PLAN.md Phase 7: whether the feed signature file was fresh
+            # (cache reused, no network call), refetched, or unavailable
+            # (fetch failed — scored on local signatures only). Set on every
+            # scan outcome, not just a threat finding, because feed_status
+            # is a property of the fetch, independent of what was found.
+            feed_status_match = re.search(r"\[feed_status:(\w+)\]", output)
+            if feed_status_match:
+                finding["feed_status"] = feed_status_match.group(1)
         if section == VIRUS_SECTION and status == "critical":
             # PLAN.md Phase 10: derived from the per-line [source] tags
             # written at the scan site, not hardcoded — findings here are one

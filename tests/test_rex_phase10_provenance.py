@@ -104,9 +104,13 @@ def test_no_destructive_filesystem_verbs_anywhere_in_rex():
     a remediation implemented as a move-to-quarantine (os.rename) or a
     truncation (os.truncate) is exactly as destructive as os.remove."""
     source = REX.read_text()
+    # os.replace( is deliberately absent here, not forgotten: PLAN.md Phase 7
+    # added one legitimate, reviewed use (the feed-cache atomic write in
+    # _fetch_extra_signatures) — see _REVIEWED_WRITE_SITES below, which pins
+    # its count instead of banning the verb outright.
     forbidden = (
         "os.remove(", "os.unlink(", ".unlink(", "shutil.rmtree(",
-        "shutil.move(", "os.rename(", "os.replace(", "os.rmdir(",
+        "shutil.move(", "os.rename(", "os.rmdir(",
         "os.truncate(", "send2trash",
     )
     for verb in forbidden:
@@ -124,8 +128,13 @@ def test_no_destructive_filesystem_verbs_anywhere_in_rex():
 # "these verbs are absent" and actually enforcing "no finding may drive a write".
 _REVIEWED_WRITE_SITES = {
     # pattern: (expected count, every legitimate site)
-    r'open\([^)]*,\s*["\'][wa]': (3, "_save_config; --output; GUI export"),
+    r'open\([^)]*,\s*["\'][wa]': (4, "_save_config; --output; GUI export; "
+                                     "_fetch_extra_signatures feed cache (Phase 7)"),
     r"os\.chmod\(": (3, "_save_config; --output; GUI export"),
+    # PLAN.md Phase 7: the feed-cache write is to a cache directory this
+    # process owns, never to an audited/scanned path, and is not keyed on
+    # any finding — it is the one place os.replace() is allowed to exist.
+    r"os\.replace\(": (1, "_fetch_extra_signatures feed cache (Phase 7)"),
 }
 
 
