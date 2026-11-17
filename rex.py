@@ -245,7 +245,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.7"
+VERSION  = "1.9.8"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -956,7 +956,20 @@ def submit_malware_report(path, *, include_bytes=False, timeout=30):
     (urllib.error.URLError, OSError, socket.timeout) propagate to the
     caller rather than being swallowed here — the CLI is what maps them to
     EXIT_NETWORK; a caller that is not the CLI must see the real failure.
+
+    PLAN.md Phase 16: raises PermissionError before any of that — before
+    even os.path.getsize() — if neither AEGIS_API_KEY (env, checked first,
+    the same variable name aegis1/CLAUDE.md's autonomous worker already
+    uses) nor a persisted aegis_api_key (Phase 13/14) is present. Reporting
+    is the one thing in this file that account-gates; --audit/--capabilities
+    /--fix stay exactly as account-free as the anonymity contract claims.
     """
+    if not (os.environ.get("AEGIS_API_KEY") or _load_config().get("aegis_api_key")):
+        raise PermissionError(
+            "reporting a sample requires signing in — run with --submit-report "
+            "again after `rex --sign-in`, or use the app's sign-in prompt"
+        )
+
     size = os.path.getsize(path)
     if include_bytes and size > MAX_SAMPLE_BYTES:
         raise RexSubmitTooLarge(
@@ -3991,6 +4004,11 @@ def _rex_anonymity_contract() -> dict:
     reporting_enabled = iid is not None
     return {
         "account_required": False,
+        # PLAN.md Phase 16: a single top-level boolean can't say "required
+        # for reporting, not for the audit" — account_required stays False
+        # (the audit path genuinely needs no account) and this list is the
+        # per-command fact instead of a second, contradictory boolean.
+        "account_required_for": ["--submit-report", "--submit-sample"],
         "api_key_required": False,
         "install_id": iid,
         "telemetry": False,
@@ -4100,9 +4118,16 @@ def capabilities() -> dict:
             {"flag": "--unsuppress", "summary": "Remove one hash from the local "
                                                 "suppression list.",
              "args": ["SHA256", "--json"], "exit_codes": [EXIT_CLEAN, EXIT_USAGE]},
+            {"flag": "--sign-in", "summary": "Sign in headlessly (persists "
+                                             "aegis_api_key) so --submit-report/"
+                                             "--submit-sample don't need one. "
+                                             "'google' (default) opens a browser; "
+                                             "'key' prompts for a pasted key on stdin.",
+             "args": ["{google,key}", "--json"], "exit_codes": [EXIT_CLEAN, EXIT_USAGE]},
             {"flag": "--submit-report", "summary": "Hash a file and report its SHA-256 "
                                                     "to the AEGIS malware feed. No bytes "
-                                                    "leave the machine.",
+                                                    "leave the machine. Requires signing "
+                                                    "in first (--sign-in, or AEGIS_API_KEY).",
              "args": ["PATH", "--report-id", "--json"],
              "exit_codes": [EXIT_CLEAN, EXIT_USAGE, EXIT_NETWORK]},
             {"flag": "--submit-sample", "summary": "As --submit-report, plus opt-in "
@@ -4297,6 +4322,13 @@ def _build_argparser():
                         "positive. Local only; never reported upstream.")
     p.add_argument("--unsuppress", metavar="SHA256",
                    help="remove one hash from the local suppression list")
+    p.add_argument("--sign-in", nargs="?", const="google", choices=["google", "key"],
+                   metavar="{google,key}",
+                   help="PLAN.md Phase 16: sign in headlessly (persists aegis_api_key "
+                        "to CONFIG_PATH), so a later --submit-report/--submit-sample "
+                        "doesn't need one. 'google' (the default) opens a browser for "
+                        "the same round-trip the GUI's sign-in dialog uses; 'key' "
+                        "prompts for a pasted AEGIS Cloud key on stdin.")
     p.add_argument("--submit-report", metavar="PATH",
                    help="hash PATH and report its SHA-256 to the AEGIS malware "
                         "feed (PLAN.md Phase 6). User-initiated only — no bytes "
@@ -4376,6 +4408,22 @@ def _cli_main(argv) -> int:
               f"Unsuppressed {sha}.")
         return EXIT_CLEAN
 
+    if args.sign_in:
+        try:
+            if args.sign_in == "key":
+                key = input("Paste your AEGIS Cloud API key: ").strip()
+                data = _verify_aegis_key(key)
+                _emit(data, args.json, f"Signed in. plan: {data.get('plan')}")
+            else:
+                result = _google_sign_in()
+                _emit(result, args.json,
+                      f"Signed in as {result.get('username') or 'your AEGIS account'}.")
+        except (ValueError, RuntimeError, TimeoutError,
+                urllib.error.URLError, OSError) as e:
+            print(f"rex: sign-in failed: {e}", file=sys.stderr)
+            return EXIT_USAGE
+        return EXIT_CLEAN
+
     if args.submit_report or args.submit_sample:
         path = args.submit_report or args.submit_sample
         include_bytes = bool(args.submit_sample)
@@ -4384,6 +4432,9 @@ def _cli_main(argv) -> int:
             return EXIT_USAGE
         try:
             result = submit_malware_report(path, include_bytes=include_bytes)
+        except PermissionError as e:
+            print(f"rex: {e}", file=sys.stderr)
+            return EXIT_USAGE
         except RexSubmitTooLarge as e:
             print(f"rex: {e}", file=sys.stderr)
             return EXIT_USAGE

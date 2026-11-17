@@ -51,6 +51,16 @@ def sample_file(tmp_path):
     return f
 
 
+@pytest.fixture(autouse=True)
+def _signed_in(monkeypatch):
+    """PLAN.md Phase 16 gates submit_malware_report() on being signed in.
+    This file's tests are about Phase 6/12 behavior (install_id, cap
+    enforcement, the anonymity contract) — not the Phase 16 gate itself,
+    which has its own tests in test_rex_phase16_report_gate.py — so satisfy
+    the gate unconditionally here via the env-var escape hatch."""
+    monkeypatch.setenv("AEGIS_API_KEY", "test-key")
+
+
 # --------------------------------------------------------------------------
 # install_id persistence
 # --------------------------------------------------------------------------
