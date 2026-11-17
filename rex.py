@@ -243,7 +243,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.5"
+VERSION  = "1.9.6"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -3875,6 +3875,47 @@ def _self_sha256():
         return None
 
 
+def _rex_anonymity_contract() -> dict:
+    """PLAN.md Phase 12: the anonymity block, computed from live config state
+    rather than hardcoded, so it stays truthful once Phase 6 (opt-in malware
+    reporting) exists. _load_config() never writes, so calling this on a
+    fresh machine does not itself mint an install id."""
+    iid = _load_config().get("rex_install_id")
+    reporting_enabled = iid is not None
+    return {
+        "account_required": False,
+        "api_key_required": False,
+        "install_id": iid,
+        "telemetry": False,
+        "analytics": False,
+        "calls_home": [REPORT_ENDPOINT] if reporting_enabled else [],
+        "malware_reporting": {
+            "enabled": reporting_enabled,
+            "opt_in_flag": "--submit-report",
+            "sends": ["sha256", "file_size", "file_name",
+                      "install_id", "client_verdict"],
+            "sends_file_bytes_with": "--submit-sample",
+            "endpoint": REPORT_ENDPOINT,
+            "install_id_persisted_when": "only after first opt-in",
+        },
+        "anonymous_by_default": anonymous_mode(),
+        "default_provider": DEFAULT_PROVIDER if anonymous_mode() else "ollama",
+        "keyless_providers": list(KEYLESS_PROVIDERS),
+        "local_providers": list(LOCAL_PROVIDERS),
+        "audit_network_calls": [],
+        "opt_out_env": f"{ANONYMOUS_ENV}=0",
+        "force_lane_flag": "--anonymous",
+        "note": "The audit path makes no outbound connection at all. --fix is "
+                "the only thing the audit path can reach the network through, "
+                "and only for the provider you name; `pollinations` completes "
+                "it without identifying anyone. --submit-report/--submit-sample "
+                "are separate, user-invoked commands, never called from "
+                "--audit; see malware_reporting for what they send once you "
+                "run them. Anonymous is not the same as private: only ollama "
+                "keeps the finding on this machine.",
+    }
+
+
 def capabilities() -> dict:
     """Self-description. This is the contract an agent reads first: it can
     discover every command, schema, exit code and provider without scraping
@@ -4020,27 +4061,14 @@ def capabilities() -> dict:
         },
         # Machine-readable anonymity contract, so an agent does not have to
         # infer it: the audit and the pollinations lane need no account, no key
-        # and no install id, and nothing in rex calls home.
-        "anonymity": {
-            "account_required": False,
-            "api_key_required": False,
-            "install_id": None,
-            "telemetry": False,
-            "analytics": False,
-            "calls_home": [],
-            "anonymous_by_default": anonymous_mode(),
-            "default_provider": DEFAULT_PROVIDER if anonymous_mode() else "ollama",
-            "keyless_providers": list(KEYLESS_PROVIDERS),
-            "local_providers": list(LOCAL_PROVIDERS),
-            "audit_network_calls": [],
-            "opt_out_env": f"{ANONYMOUS_ENV}=0",
-            "force_lane_flag": "--anonymous",
-            "note": "The audit path makes no outbound connection at all. --fix is the "
-                    "only thing that can reach the network, and only for the provider "
-                    "you name; `pollinations` completes it without identifying anyone. "
-                    "Anonymous is not the same as private: only ollama keeps the "
-                    "finding on this machine.",
-        },
+        # and no install id, and nothing on the audit path calls home.
+        #
+        # PLAN.md Phase 12: install_id/calls_home read the config file rather
+        # than hardcoding None/[] — _load_config() never writes, so a fresh
+        # machine still reports install_id: None here, and only a prior,
+        # user-invoked --submit-report/--submit-sample (which is what persists
+        # rex_install_id) flips malware_reporting.enabled/calls_home true.
+        "anonymity": _rex_anonymity_contract(),
         "config_file": CONFIG_PATH,
         "safety": {
             "applies_by_default": False,

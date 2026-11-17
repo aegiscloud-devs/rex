@@ -767,6 +767,10 @@ def test_capabilities_publishes_the_anonymity_contract():
     assert anon["install_id"] is None
     assert anon["telemetry"] is False
     assert anon["calls_home"] == []
+    # PLAN.md Phase 12: reporting is opt-in and off until a real --submit-*
+    # invocation persists an install id — see test_rex_phase6_report_submission.py
+    # for the enabled-after-opt-in half of this contract.
+    assert anon["malware_reporting"]["enabled"] is False
     assert "pollinations" in anon["keyless_providers"]
     assert anon["local_providers"] == ["ollama"]
 

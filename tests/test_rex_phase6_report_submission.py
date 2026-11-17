@@ -215,3 +215,67 @@ def test_install_id_not_minted_by_capabilities_or_audit(monkeypatch, tmp_path):
 
     rexmod._cli_main(["--audit", "--json"])
     assert "rex_install_id" not in rexmod._load_config()
+
+
+# --------------------------------------------------------------------------
+# PLAN.md Phase 12 — the anonymity contract stays truthful once reporting
+# exists: it must describe live opt-in state, not aspirational prose.
+# --------------------------------------------------------------------------
+
+def test_anonymity_contract_on_a_fresh_config_path_is_not_enabled(
+    monkeypatch, tmp_path
+):
+    """A machine that has never opted in must report install_id: None and
+    calls_home: [] — and capabilities() must not be what flips that, i.e.
+    reading the contract must not itself create the config file."""
+    cfg_path = tmp_path / "never-touched.json"
+    monkeypatch.setattr(rexmod, "CONFIG_PATH", str(cfg_path))
+
+    anon = rexmod.capabilities()["anonymity"]
+
+    assert anon["install_id"] is None
+    assert anon["calls_home"] == []
+    assert anon["malware_reporting"]["enabled"] is False
+    assert not cfg_path.exists()
+
+
+def test_anonymity_contract_flips_true_only_after_a_real_opt_in(
+    monkeypatch, tmp_path, sample_file
+):
+    """Reporting must look disabled until the user has actually invoked
+    --submit-report/--submit-sample at least once, and enabled afterward —
+    the contract tracks what submit_malware_report() persisted, not a flag
+    set in advance."""
+    monkeypatch.setattr(rexmod, "CONFIG_PATH", str(tmp_path / "cfg.json"))
+    monkeypatch.setattr(rexmod.urllib.request, "urlopen", _fake_urlopen([]))
+
+    before = rexmod.capabilities()["anonymity"]
+    assert before["install_id"] is None
+    assert before["malware_reporting"]["enabled"] is False
+
+    rexmod.submit_malware_report(str(sample_file))
+
+    after = rexmod.capabilities()["anonymity"]
+    assert after["install_id"] == rexmod._load_config()["rex_install_id"]
+    assert after["calls_home"] == [rexmod.REPORT_ENDPOINT]
+    assert after["malware_reporting"]["enabled"] is True
+
+
+def test_anonymity_contract_sends_list_matches_what_is_actually_sent(
+    monkeypatch, tmp_path, sample_file
+):
+    """Assert against what submit_malware_report() actually puts on the
+    wire, not against the contract's own prose — a drifted field list would
+    otherwise pass silently forever."""
+    monkeypatch.setattr(rexmod, "CONFIG_PATH", str(tmp_path / "cfg.json"))
+    captured = []
+    monkeypatch.setattr(rexmod.urllib.request, "urlopen", _fake_urlopen(captured))
+
+    rexmod.submit_malware_report(str(sample_file), include_bytes=False)
+
+    sends = rexmod.capabilities()["anonymity"]["malware_reporting"]["sends"]
+    assert set(sends) == set(captured[0].keys())
+
+    rexmod.submit_malware_report(str(sample_file), include_bytes=True)
+    assert "sample" not in sends  # bytes are the separate sends_file_bytes_with lane
+    assert "sample" in captured[1]
