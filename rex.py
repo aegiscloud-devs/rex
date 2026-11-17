@@ -57,8 +57,9 @@ QT_MISSING_MSG = (
 
 HAS_QT = False
 try:
-    from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QColor, QPainter, QPalette, QPen
+    from PyQt6.QtCore import QByteArray, Qt, QThread, QTimer, pyqtSignal
+    from PyQt6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap
+    from PyQt6.QtSvg import QSvgRenderer
     from PyQt6.QtWidgets import (
         QApplication,
         QDialog,
@@ -88,7 +89,8 @@ except ImportError:
     QApplication = QMainWindow = QWidget = QVBoxLayout = QHBoxLayout = \
         QPushButton = QLabel = QTextEdit = QFrame = QListWidget = \
         QListWidgetItem = QProgressBar = QFileDialog = QDialog = QLineEdit = \
-        QThread = QTimer = _QtUnavailable
+        QThread = QTimer = QIcon = QPixmap = QByteArray = QSvgRenderer = \
+        _QtUnavailable
 
     class _InertSignal:
         """pyqtSignal stand-in: connect()/emit() are no-ops, not AttributeError."""
@@ -243,7 +245,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.6"
+VERSION  = "1.9.7"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -988,6 +990,111 @@ def submit_malware_report(path, *, include_bytes=False, timeout=30):
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+# PLAN.md Phases 13-14 — AEGIS Cloud / Google sign-in. Entirely separate from
+# the malware-reporting install_id above: this persists aegis_api_key /
+# aegis_username, an *account* identity, never the self-asserted report
+# install_id. Nothing on the audit path calls either of these; both are
+# user-invoked only (--sign-in-google / --sign-in-key, wired in Phase 15/16).
+
+def _google_sign_in(api_base="https://aegiscloud.org", timeout=300):
+    """Open the system browser for aegis1's existing Google round-trip and
+    wait for it to redirect back here. Returns {"api_key", "username",
+    "memory_token"} or raises. Mirrors aegiscode-plugin's
+    client/google-signin.js exactly — same URL shape, same query params —
+    because that protocol is aegis1's, not Electron's, and is already proven
+    against production."""
+    import http.server
+    import threading
+    import webbrowser
+    from urllib.parse import parse_qs, urlencode, urlparse
+
+    result = {}
+    done = threading.Event()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = parse_qs(urlparse(self.path).query)
+            token = qs.get("token", [None])[0]
+            error = qs.get("error", [None])[0]
+            if not token and not error:
+                self.send_response(404)
+                self.end_headers()
+                return
+            result["api_key"] = token
+            result["username"] = qs.get("username", [None])[0]
+            result["memory_token"] = qs.get("memory_token", [None])[0]
+            result["error"] = error
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            msg = ("Signed in. You can close this tab and return to rex." if token
+                   else f"Sign-in failed: {error}. You can close this tab and try again.")
+            self.wfile.write(
+                f'<!doctype html><title>AEGIS</title><body style="font:16px '
+                f'sans-serif;max-width:32rem;margin:4rem auto;text-align:center">'
+                f"<p>{msg}</p></body>".encode()
+            )
+            done.set()
+
+        def log_message(self, *a):
+            pass  # no stderr noise for a one-shot localhost server
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    # A bare `server.handle_request()` blocks in accept() with no timeout;
+    # closing the socket from this thread afterward does not unblock that
+    # syscall on Linux, so a timed-out sign-in would leak the listening
+    # socket (and the thread) for the rest of the process's life. Giving the
+    # server a short poll timeout and looping lets the thread notice `stop`
+    # between polls instead of being stuck in an accept() call forever.
+    server.timeout = 0.2
+    stop = threading.Event()
+
+    def _serve():
+        while not done.is_set() and not stop.is_set():
+            server.handle_request()
+
+    threading.Thread(target=_serve, daemon=True).start()
+
+    callback = f"http://127.0.0.1:{port}"
+    url = f"{api_base}/auth/google?" + urlencode({"callback": callback})
+    webbrowser.open(url)
+
+    if not done.wait(timeout):
+        stop.set()
+        server.server_close()
+        raise TimeoutError(f"timed out after {timeout}s waiting for the browser sign-in")
+    server.server_close()
+    if result.get("error"):
+        raise RuntimeError(result["error"])
+
+    _save_config({"aegis_api_key": result["api_key"], "aegis_username": result["username"]})
+    return {"api_key": result["api_key"], "username": result["username"],
+            "memory_token": result["memory_token"]}
+
+
+def _verify_aegis_key(key, api_base="https://aegiscloud.org", timeout=10):
+    """Validate a pasted AEGIS Cloud API key against aegis1. Raises on an
+    invalid key or a network failure; never silently accepts an unverified
+    key — a typo'd key must fail loudly, not look logged-in and then fail
+    the first report submission with no context."""
+    req = urllib.request.Request(
+        api_base.rstrip("/") + "/api/v1/auth/validate-key",
+        data=json.dumps({"key": key}).encode(),
+        headers={"Content-Type": "application/json",
+                 # Required or aegis1 answers 426 (app.py:2437-2439) —
+                 # discovered by reading the route, not assumed.
+                 "X-AEGIS-Version": VERSION},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
+    if not data.get("valid"):
+        raise ValueError("that key was not accepted by AEGIS Cloud")
+    _save_config({"aegis_api_key": key})
+    return data  # {"valid": true, "plan": "...", "version": "..."}
+
 
 # ============================================================
 # LATTICE BAKGRUND (diamond lattice — upgraded)
@@ -3889,6 +3996,12 @@ def _rex_anonymity_contract() -> dict:
         "telemetry": False,
         "analytics": False,
         "calls_home": [REPORT_ENDPOINT] if reporting_enabled else [],
+        # PLAN.md Phase 15: the GUI's own sign-in gate, reported honestly —
+        # it is shown, it is skippable, and (this phase) it blocks nothing.
+        # account_required/api_key_required stay False here; Phase 16 is
+        # the one place that becomes conditionally true, scoped to
+        # submitting a malware report.
+        "gui_sign_in_prompt": {"shown": True, "skippable": True, "blocks_audit": False},
         "malware_reporting": {
             "enabled": reporting_enabled,
             "opt_in_flag": "--submit-report",
@@ -4821,6 +4934,192 @@ class ApplyWorker(QThread):
                    else "⚠ Some commands need manual review")
         self.finished.emit(summary, "\n\n".join(lines))
 
+
+class _GoogleSignInWorker(QThread):
+    """Bridges _google_sign_in()'s up-to-5-minute blocking wait onto the Qt
+    main thread — same pattern _ProviderWorker uses for provider_stream()."""
+
+    succeeded = pyqtSignal(dict)
+    failed    = pyqtSignal(str)
+
+    def __init__(self, api_base="https://aegiscloud.org"):
+        QThread.__init__(self)
+        self.api_base = api_base
+
+    def run(self):
+        try:
+            result = _google_sign_in(api_base=self.api_base)
+        except Exception as e:  # noqa: BLE001 — surfaced via the signal, not raised on this thread
+            self.failed.emit(str(e))
+            return
+        self.succeeded.emit(result)
+
+
+class SignInDialog(QDialog):
+    """PLAN.md Phase 15 — the sign-in gate, shown once per profile from
+    main() before SecurityAuditWindow exists. Layout matches
+    aegiscode-plugin's onboarding card (desktop/renderer/index.html,
+    style.css .onboard-*) exactly — same glyph, headline, Google pill, key
+    pill, status line, skip link. Skippable, and nothing here ever blocks
+    the audit (see PLAN.md Phase 16 for where sign-in becomes a hard
+    requirement, scoped narrowly to submitting a malware report)."""
+
+    # Exact path data from aegiscode-plugin/desktop/renderer/index.html:1747-1752
+    # (the plugin's own Google "G" mark) — pixel-equivalent, not redrawn.
+    _G_SVG = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
+        b'<path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.9 29.3 36 24 36'
+        b'c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l5.7-5.7C34.6 6.5 29.6 4 '
+        b'24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.7-.4-3.5z"/>'
+        b'<path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 16 19 13 24 13c3.1 0 5.8 1.1 '
+        b'8 3l5.7-5.7C34.6 6.5 29.6 4 24 4 16.3 4 9.6 8.3 6.3 14.7z"/>'
+        b'<path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 '
+        b'36 24 36c-5.3 0-9.7-3.1-11.3-7.6l-6.5 5C9.5 39.6 16.2 44 24 44z"/>'
+        b'<path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.1 5.6'
+        b'l6.2 5.2C40.9 36.6 44 30.9 44 24c0-1.3-.1-2.7-.4-3.5z"/>'
+        b'</svg>'
+    )
+
+    # aegiscode-plugin style.css: --google-blue. Not in rex's own COLORS dict
+    # (that dict is rex's brand palette; this one color belongs to Google's,
+    # not rex's, identity and is used nowhere else).
+    GOOGLE_BLUE = "#4285f4"
+
+    def __init__(self, parent=None, api_base="https://aegiscloud.org"):
+        super().__init__(parent)
+        self.api_base = api_base
+        self.result = None  # {"api_key", "username"?, "plan"?} once signed in
+        self._worker = None
+        self.setWindowTitle("Welcome to rex")
+        self.setFixedWidth(360)
+        # aegiscode-plugin's --r-pill is CSS `999px` (relative to the
+        # button's own height); QSS border-radius is a fixed px value, so
+        # it is computed here from this dialog's ~40px-tall buttons instead
+        # of copying the keyword literally, which would do nothing in QSS.
+        pill = 20
+        self.setStyleSheet(f"""
+            QDialog {{ background:{COLORS['bg']}; }}
+            QLabel#glyph  {{ color:{COLORS['text']}; font-size:40px; font-weight:800; }}
+            QLabel#title  {{ color:{COLORS['text']}; font-size:17px; font-weight:600; }}
+            QLabel#sub    {{ color:{COLORS['text2']}; font-size:12px; }}
+            QLabel#status {{ color:{COLORS['text2']}; font-size:11px; min-height:14px; }}
+            QPushButton {{ border-radius:{pill}px; border:1px solid {COLORS['border2']};
+                           background:{COLORS['bg2']}; color:{COLORS['text']};
+                           font-size:13px; font-weight:600; padding:11px 16px; }}
+            QPushButton#google {{ background:{self.GOOGLE_BLUE}; border-color:{self.GOOGLE_BLUE};
+                                  color:#ffffff; }}
+            QPushButton#skip {{ background:transparent; border:none; font-weight:normal;
+                                color:{COLORS['text3']}; font-size:11px; padding:4px; }}
+            QPushButton:disabled {{ color:{COLORS['text3']}; }}
+            QLineEdit {{ background:{COLORS['bg3']}; color:{COLORS['text']};
+                         border:1px solid {COLORS['border']}; border-radius:6px;
+                         padding:8px; font-size:12px; }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(28, 32, 28, 20)
+        layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        glyph = QLabel("Æ")
+        glyph.setObjectName("glyph")
+        glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(glyph)
+
+        title = QLabel("Welcome to rex")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        sub = QLabel("Sign in to report malware findings to the AEGIS feed.")
+        sub.setObjectName("sub")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+        layout.addSpacing(8)
+
+        self.btn_google = QPushButton("  Continue with Google")
+        self.btn_google.setObjectName("google")
+        self.btn_google.setIcon(self._google_icon())
+        layout.addWidget(self.btn_google)
+
+        self.btn_key = QPushButton("Continue with an AEGIS Cloud key")
+        layout.addWidget(self.btn_key)
+
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Paste your AEGIS Cloud API key")
+        self.key_input.setVisible(False)
+        layout.addWidget(self.key_input)
+
+        self.btn_verify = QPushButton("Verify")
+        self.btn_verify.setVisible(False)
+        layout.addWidget(self.btn_verify)
+
+        self.status = QLabel("")
+        self.status.setObjectName("status")
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        self.btn_skip = QPushButton("Skip for now")
+        self.btn_skip.setObjectName("skip")
+        layout.addWidget(self.btn_skip)
+
+        self.btn_google.clicked.connect(self._start_google)
+        self.btn_key.clicked.connect(self._reveal_key_field)
+        self.btn_verify.clicked.connect(self._verify_key)
+        self.btn_skip.clicked.connect(self.reject)
+
+    def _google_icon(self):
+        renderer = QSvgRenderer(QByteArray(self._G_SVG))
+        pixmap = QPixmap(18, 18)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _set_busy(self, busy, message="", color=None):
+        self.btn_google.setEnabled(not busy)
+        self.btn_key.setEnabled(not busy)
+        self.btn_verify.setEnabled(not busy)
+        self.status.setStyleSheet(f"color:{color or COLORS['text2']};")
+        self.status.setText(message)
+
+    def _reveal_key_field(self):
+        self.key_input.setVisible(True)
+        self.btn_verify.setVisible(True)
+        self.key_input.setFocus()
+
+    def _start_google(self):
+        self._set_busy(True, "Opening your browser…")
+        self._worker = _GoogleSignInWorker(self.api_base)
+        self._worker.succeeded.connect(self._on_google_success)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_google_success(self, result):
+        self.result = result
+        self._set_busy(False, f"Signed in as {result.get('username') or 'your AEGIS account'}.",
+                        color=COLORS["green"])
+        self.accept()
+
+    def _verify_key(self):
+        key = self.key_input.text().strip()
+        if not key:
+            return
+        self._set_busy(True, "Verifying…")
+        try:
+            data = _verify_aegis_key(key, api_base=self.api_base)
+        except Exception as e:  # noqa: BLE001 — shown in the dialog, not raised to the caller
+            self._on_failed(str(e))
+            return
+        self.result = {"api_key": key, "plan": data.get("plan")}
+        self._set_busy(False, "Signed in.", color=COLORS["green"])
+        self.accept()
+
+    def _on_failed(self, message):
+        self._set_busy(False, message, color=COLORS["red"])
 
 
 class RemediationDialog(QDialog):
@@ -5914,6 +6213,10 @@ def main(argv=None):
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)
+    cfg = _load_config()
+    if not cfg.get("_onboarding_seen") and not cfg.get("aegis_api_key"):
+        SignInDialog().exec()
+        _save_config({"_onboarding_seen": True})
     win = SecurityAuditWindow()
     win.show()
     return app.exec()
