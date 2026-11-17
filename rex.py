@@ -241,7 +241,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.1"
+VERSION  = "1.9.2"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -797,6 +797,24 @@ AUDIT_SECTIONS = [
 ]
 
 VIRUS_SECTION = "Virus Scan (ClamAV)"
+
+# PLAN.md Phase 10 — provenance for virus-scan findings, and the hard rule it
+# exists to enforce. rex 1.9.1 has no delete/quarantine/remediation code path
+# of any kind for a ClamAV hit (verified: no os.remove, os.unlink,
+# shutil.rmtree or shutil.move anywhere in this file) — a hit is reported,
+# never acted on. That must stay true specifically for a feed-sourced hit,
+# because a future signature feed (Phase 7) is reachable by an attacker who
+# gets a hash into the feed, where a local ClamAV signature is not.
+SIGNATURE_SOURCE_LOCAL     = "clamav_local"
+SIGNATURE_SOURCE_FEED      = "feed_confirmed"
+SIGNATURE_SOURCE_HEURISTIC = "heuristic"
+
+# If a future phase ever adds remediation (delete/truncate/chmod/quarantine/
+# move) for a ClamAV finding, it must gate on signature_source ==
+# SIGNATURE_SOURCE_LOCAL explicitly and refuse outright for every source
+# named here — never the inverse (an allow-list of what's safe to act on,
+# not a block-list of what to exclude).
+NO_REMEDIATION_SIGNATURE_SOURCES = (SIGNATURE_SOURCE_FEED, SIGNATURE_SOURCE_HEURISTIC)
 
 # Sections that cannot be assessed at all without psutil — keep in sync with
 # the `if psutil is None` guards in _run_section.
@@ -2088,7 +2106,15 @@ class AuditEngine:
                     )
                 proc.wait()
                 if threats:
-                    summary = f"⚠  {len(threats)} THREAT(S) FOUND\n\n" + "\n".join(threats)
+                    # PLAN.md Phase 10: every threat line this scan reports is
+                    # today exclusively SIGNATURE_SOURCE_LOCAL — there is no
+                    # other source yet (Phase 7 is what introduces one). The
+                    # tag travels in the text itself because findings in this
+                    # tool are one dict per SECTION (build_report()), not one
+                    # per threat line — this is the channel that actually
+                    # reaches the JSON report today.
+                    tagged = [f"[{SIGNATURE_SOURCE_LOCAL}] {t}" for t in threats]
+                    summary = f"⚠  {len(threats)} THREAT(S) FOUND\n\n" + "\n".join(tagged)
                     return "critical", summary
                 return "ok", (f"✓ Clean — {files_scanned} files scanned\n"
                               f"Engine: {tool}\nPath: {scan_path}")
@@ -3575,7 +3601,7 @@ def build_report(results: dict, scan_path: str | None = None, include_output: bo
         status, output = results[section]
         output = output or ""
         is_redacted = redact and section in REDACTED_SECTIONS
-        findings.append({
+        finding = {
             "id":         section_id(section),
             "section":    section,
             "index":      idx,
@@ -3589,7 +3615,29 @@ def build_report(results: dict, scan_path: str | None = None, include_output: bo
             "line_count": len(output.splitlines()),
             "output":     (REDACTED_SENSITIVE
                            if is_redacted else (output if include_output else None)),
-        })
+        }
+        if section == VIRUS_SECTION and status == "critical":
+            # PLAN.md Phase 10: derived from the per-line [source] tags
+            # written at the scan site, not hardcoded — findings here are one
+            # dict per SECTION, not per threat line, so a report that mixes
+            # a local hit with a feed-matched one (once Phase 7 exists) must
+            # say "mixed" rather than silently picking one. The per-line
+            # tags in `output` remain the authoritative per-line answer.
+            sources_present = {
+                src for src in (SIGNATURE_SOURCE_LOCAL, SIGNATURE_SOURCE_FEED,
+                                SIGNATURE_SOURCE_HEURISTIC)
+                if f"[{src}]" in output
+            }
+            if len(sources_present) == 1:
+                finding["signature_source"] = next(iter(sources_present))
+            elif sources_present:
+                finding["signature_source"] = "mixed"
+            else:
+                # Untagged threat lines predate Phase 10's tagging (or came
+                # from a path this phase didn't update) — reported as
+                # unknown rather than assumed safe.
+                finding["signature_source"] = "unknown"
+        findings.append(finding)
 
     score = audit_score(results)
     return {
@@ -3692,6 +3740,13 @@ def capabilities() -> dict:
              "emits": SCHEMA_PLAN,
              "targets": list(HARDEN_TARGETS),
              "exit_codes": [EXIT_CLEAN, EXIT_USAGE, EXIT_APPLY]},
+            {"flag": "--suppressed-signatures", "summary": "List sha256 hashes "
+                                                            "suppressed locally. Local "
+                                                            "only; never reported upstream.",
+             "args": ["--json"], "exit_codes": [EXIT_CLEAN]},
+            {"flag": "--unsuppress", "summary": "Remove one hash from the local "
+                                                "suppression list.",
+             "args": ["SHA256", "--json"], "exit_codes": [EXIT_CLEAN, EXIT_USAGE]},
         ],
         "schemas": {"audit": SCHEMA_AUDIT, "fix": SCHEMA_FIX,
                     "harden": SCHEMA_HARDEN, "plan": SCHEMA_PLAN,
@@ -3885,6 +3940,12 @@ def _build_argparser():
     p.add_argument("--scan-target", metavar="DIR", default="/home",
                    help="directory the scheduled ClamAV timer scans "
                         "(default: /home)")
+    p.add_argument("--suppressed-signatures", action="store_true",
+                   help="list sha256 hashes suppressed locally (PLAN.md Phase 10) — "
+                        "a feed-sourced finding you've reviewed and judged a false "
+                        "positive. Local only; never reported upstream.")
+    p.add_argument("--unsuppress", metavar="SHA256",
+                   help="remove one hash from the local suppression list")
     return p
 
 
@@ -3933,6 +3994,24 @@ def _cli_main(argv) -> int:
         text = "\n".join(f"{c['id']:<28} {c['section']}" for c in checks)
         _emit({"schema": SCHEMA_CAPABILITIES, "version": VERSION, "checks": checks},
               args.json, text)
+        return EXIT_CLEAN
+
+    if args.suppressed_signatures:
+        sigs = sorted(_load_config().get("suppressed_signatures") or [])
+        _emit({"schema": SCHEMA_CAPABILITIES, "suppressed_signatures": sigs},
+              args.json, "\n".join(sigs) if sigs else "No suppressed signatures.")
+        return EXIT_CLEAN
+
+    if args.unsuppress:
+        cfg = _load_config()
+        sigs = cfg.get("suppressed_signatures") or []
+        sha = args.unsuppress.strip().lower()
+        if sha not in sigs:
+            print(f"rex: {sha} is not suppressed", file=sys.stderr)
+            return EXIT_USAGE
+        _save_config({"suppressed_signatures": [s for s in sigs if s != sha]})
+        _emit({"schema": SCHEMA_CAPABILITIES, "unsuppressed": sha}, args.json,
+              f"Unsuppressed {sha}.")
         return EXIT_CLEAN
 
     if args.harden:
