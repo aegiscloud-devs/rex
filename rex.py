@@ -245,7 +245,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.8"
+VERSION  = "1.9.9"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -963,8 +963,15 @@ def submit_malware_report(path, *, include_bytes=False, timeout=30):
     uses) nor a persisted aegis_api_key (Phase 13/14) is present. Reporting
     is the one thing in this file that account-gates; --audit/--capabilities
     /--fix stay exactly as account-free as the anonymity contract claims.
+
+    PLAN.md Phase 17: the resolved key (always present once Phase 16 gates
+    this call) rides as `Authorization: Bearer <key>`, so aegis1 can key the
+    distinct-reporter count by account instead of the self-asserted
+    install_id — strictly harder to mint than a free string, for exactly
+    the users who signed in.
     """
-    if not (os.environ.get("AEGIS_API_KEY") or _load_config().get("aegis_api_key")):
+    aegis_key = os.environ.get("AEGIS_API_KEY") or _load_config().get("aegis_api_key")
+    if not aegis_key:
         raise PermissionError(
             "reporting a sample requires signing in — run with --submit-report "
             "again after `rex --sign-in`, or use the app's sign-in prompt"
@@ -998,7 +1005,8 @@ def submit_malware_report(path, *, include_bytes=False, timeout=30):
     req = urllib.request.Request(
         REPORT_ENDPOINT,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {aegis_key}"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
