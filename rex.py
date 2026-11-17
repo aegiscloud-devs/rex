@@ -12,8 +12,10 @@
 # directives rather than being narrowed to exception classes — narrowing them
 # would convert a reported finding into an unhandled traceback.
 
+import base64
 import contextlib
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -241,7 +243,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.2"
+VERSION  = "1.9.3"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -845,6 +847,86 @@ def _save_config(data: dict):
             os.chmod(CONFIG_PATH, 0o600)
     except Exception:  # noqa: BLE001, S110
         pass
+
+# PLAN.md Phase 6 — crowd-sourced malware reporting, user-initiated only.
+# Nothing on the audit path calls any of this; see Phase 12 for the
+# anonymity-contract fields this phase deliberately leaves alone.
+REPORT_ENDPOINT = "https://aegiscloud.org/api/rex/report-sample"
+MAX_SAMPLE_BYTES = 10 * 1024 * 1024  # --submit-sample's upload cap
+
+
+class RexSubmitTooLarge(ValueError):
+    """--submit-sample's file exceeds MAX_SAMPLE_BYTES. Raised before
+    anything is read or sent — never truncated, never sent partially."""
+
+
+def _get_or_create_install_id() -> str:
+    """Self-asserted, locally-generated install identity — raises the cost
+    of trivial report spam; NOT an authentication credential. See
+    PLAN.md Phase 1 for why the server never trusts this alone.
+
+    Call this ONLY from submit_malware_report(), after the user has opted
+    in by invoking --submit-report/--submit-sample. Calling it from the
+    audit path or from capabilities() would mint an identifier on disk
+    merely from running --audit, falsifying the anonymity contract
+    ("install_id": None, "calls_home": []) documented there.
+    """
+    cfg = _load_config()
+    iid = cfg.get("rex_install_id")
+    if not iid:
+        import secrets as _secrets
+        iid = _secrets.token_hex(16)
+        _save_config({"rex_install_id": iid})
+    return iid
+
+
+def submit_malware_report(path, *, include_bytes=False, timeout=30):
+    """Report a suspected-malware file's SHA-256 to the AEGIS feed.
+
+    By default ONLY the hash, size and file name leave the machine. Bytes
+    are sent only when include_bytes=True (--submit-sample). User-initiated
+    only — nothing calls this from the audit path, and it must never be
+    scheduled or made automatic.
+
+    Raises RexSubmitTooLarge (before reading or sending anything) if
+    include_bytes and the file is over MAX_SAMPLE_BYTES. Network failures
+    (urllib.error.URLError, OSError, socket.timeout) propagate to the
+    caller rather than being swallowed here — the CLI is what maps them to
+    EXIT_NETWORK; a caller that is not the CLI must see the real failure.
+    """
+    size = os.path.getsize(path)
+    if include_bytes and size > MAX_SAMPLE_BYTES:
+        raise RexSubmitTooLarge(
+            f"{path} is {size} bytes, over the {MAX_SAMPLE_BYTES}-byte "
+            "--submit-sample cap — refusing without sending anything"
+        )
+
+    hasher = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            hasher.update(chunk)
+
+    payload = {
+        "sha256": hasher.hexdigest(),
+        "file_size": size,
+        # basename only — a full path would leak the user's directory layout.
+        "file_name": os.path.basename(path),
+        "install_id": _get_or_create_install_id(),
+        # display-only on the server (PLAN.md Phase 1): never a gating input.
+        "client_verdict": "suspected",
+    }
+    if include_bytes:
+        with open(path, "rb") as fh:
+            payload["sample"] = base64.b64encode(fh.read()).decode("ascii")
+
+    req = urllib.request.Request(
+        REPORT_ENDPOINT,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 # ============================================================
 # LATTICE BAKGRUND (diamond lattice — upgraded)
@@ -3553,6 +3635,7 @@ EXIT_FINDINGS = 1   # audit ran, findings at or above the threshold
 EXIT_USAGE    = 2   # bad arguments / bad input file
 EXIT_PROVIDER = 3   # AI provider unreachable, unauthorized, or out of budget
 EXIT_APPLY    = 4   # --apply ran and at least one command failed
+EXIT_NETWORK  = 5   # --submit-report/--submit-sample: report endpoint unreachable
 
 SEVERITY_BY_STATUS = {
     "critical": "critical",
@@ -3747,6 +3830,16 @@ def capabilities() -> dict:
             {"flag": "--unsuppress", "summary": "Remove one hash from the local "
                                                 "suppression list.",
              "args": ["SHA256", "--json"], "exit_codes": [EXIT_CLEAN, EXIT_USAGE]},
+            {"flag": "--submit-report", "summary": "Hash a file and report its SHA-256 "
+                                                    "to the AEGIS malware feed. No bytes "
+                                                    "leave the machine.",
+             "args": ["PATH", "--report-id", "--json"],
+             "exit_codes": [EXIT_CLEAN, EXIT_USAGE, EXIT_NETWORK]},
+            {"flag": "--submit-sample", "summary": "As --submit-report, plus opt-in "
+                                                    "upload of the file's bytes "
+                                                    f"(base64, <= {MAX_SAMPLE_BYTES // (1024 * 1024)} MB).",
+             "args": ["PATH", "--report-id", "--json"],
+             "exit_codes": [EXIT_CLEAN, EXIT_USAGE, EXIT_NETWORK]},
         ],
         "schemas": {"audit": SCHEMA_AUDIT, "fix": SCHEMA_FIX,
                     "harden": SCHEMA_HARDEN, "plan": SCHEMA_PLAN,
@@ -3757,6 +3850,7 @@ def capabilities() -> dict:
             str(EXIT_USAGE):    "bad arguments or unreadable input",
             str(EXIT_PROVIDER): "provider unreachable/unauthorized/out of budget",
             str(EXIT_APPLY):    "a fix was applied and at least one command failed",
+            str(EXIT_NETWORK):  "--submit-report/--submit-sample could not reach the report endpoint",
         },
         "default_fail_on": "none",
         "status_vocabulary": {
@@ -3946,6 +4040,17 @@ def _build_argparser():
                         "positive. Local only; never reported upstream.")
     p.add_argument("--unsuppress", metavar="SHA256",
                    help="remove one hash from the local suppression list")
+    p.add_argument("--submit-report", metavar="PATH",
+                   help="hash PATH and report its SHA-256 to the AEGIS malware "
+                        "feed (PLAN.md Phase 6). User-initiated only — no bytes "
+                        "leave the machine.")
+    p.add_argument("--submit-sample", metavar="PATH",
+                   help="as --submit-report, plus opt-in upload of PATH's bytes "
+                        f"(base64, <= {MAX_SAMPLE_BYTES // (1024 * 1024)} MB; "
+                        "refuses over the cap rather than truncating)")
+    p.add_argument("--report-id", action="store_true",
+                   help="with --submit-report/--submit-sample and --json: print "
+                        "the server's report_id and verdict")
     return p
 
 
@@ -4012,6 +4117,28 @@ def _cli_main(argv) -> int:
         _save_config({"suppressed_signatures": [s for s in sigs if s != sha]})
         _emit({"schema": SCHEMA_CAPABILITIES, "unsuppressed": sha}, args.json,
               f"Unsuppressed {sha}.")
+        return EXIT_CLEAN
+
+    if args.submit_report or args.submit_sample:
+        path = args.submit_report or args.submit_sample
+        include_bytes = bool(args.submit_sample)
+        if not os.path.isfile(path):
+            print(f"rex: {path}: no such file", file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            result = submit_malware_report(path, include_bytes=include_bytes)
+        except RexSubmitTooLarge as e:
+            print(f"rex: {e}", file=sys.stderr)
+            return EXIT_USAGE
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            print(f"rex: could not reach {REPORT_ENDPOINT}: {e}", file=sys.stderr)
+            return EXIT_NETWORK
+        if args.report_id:
+            _emit(result, args.json,
+                  f"report_id: {result.get('report_id')}  "
+                  f"verdict: {result.get('verdict')}")
+        else:
+            _emit(result, args.json, "Report submitted.")
         return EXIT_CLEAN
 
     if args.harden:
