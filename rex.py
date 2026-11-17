@@ -243,7 +243,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.4"
+VERSION  = "1.9.5"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -3858,6 +3858,23 @@ def build_report(results: dict, scan_path: str | None = None, include_output: bo
     }
 
 
+def _self_sha256():
+    """This running file's own SHA-256 (PLAN.md Phase 8) — purely
+    informational. Lets a script or agent that already has a copy diff what
+    it's running against what the download page currently advertises,
+    without a separate tool invocation. rex.py cannot meaningfully attest to
+    its own integrity this way — a tampered copy could patch this function
+    out too. The actual verification is RELEASING.md's `ssh-keygen -Y
+    verify` against the signed release; this field is a convenience, not
+    a proof.
+    """
+    try:
+        with open(__file__, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def capabilities() -> dict:
     """Self-description. This is the contract an agent reads first: it can
     discover every command, schema, exit code and provider without scraping
@@ -3866,6 +3883,7 @@ def capabilities() -> dict:
         "schema":  SCHEMA_CAPABILITIES,
         "tool":    APP_NAME,
         "version": VERSION,
+        "self_sha256": _self_sha256(),
         "entrypoint": "python3 rex.py",
         "headless": True,
         "gui_available": HAS_QT,

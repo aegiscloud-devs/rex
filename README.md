@@ -4,12 +4,17 @@
 
 Single Python file. No server. No telemetry. Runs entirely on your machine.
 
-**Source of truth.** This repo — `rex.py` here — is the only place rex is
-developed. The copy served from the website
-(`aegis1/static/source-backup/rex.py`) and the one published to npm
-(`attic/misc/rex-npm/vendor/rex.py`) are build artifacts, promoted from here by
+### Source of truth
+
+This repo — `rex.py` here — is the only place rex is developed. The copy
+served from the website (`aegis1/static/source-backup/rex.py`) and the one
+published to npm (`attic/misc/rex-npm/vendor/rex.py`) are build artifacts,
+promoted from here by
 [`scripts/promote_to_site.sh`](scripts/promote_to_site.sh). Never edit either
 copy directly — the next promotion overwrites it silently (PLAN.md Phase 11).
+
+Releasing also means signing — see [RELEASING.md](RELEASING.md) for the
+(deliberately manual, offline) key generation and signing steps.
 
 ---
 
