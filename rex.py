@@ -1280,6 +1280,133 @@ class LatticeWidget(QWidget):
         p.end()
 
 
+class ScanMeterWidget(QWidget):
+    """Segmented, animated progress meter for the virus scan.
+
+    A QProgressBar can only draw one continuous bar, and the scan's real
+    problem is that it looks frozen: clamscan spends ~19s verifying the
+    signature database before it opens a single file, then streams thousands of
+    paths with no visible motion. This draws discrete blocks that fill as
+    segments complete, with the leading block breathing and a spark riding it,
+    reusing the layered-glow idiom from LatticeWidget so the two panels look
+    like one system rather than two.
+
+    No emoji, no glyph stand-ins: every mark is drawn with QPainter.
+    """
+
+    BLOCK_MAX = 44
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(22)
+        self.setMinimumWidth(220)
+        self._blocks = 0          # how many blocks this meter will show
+        self._filled = 0          # how many blocks are filled
+        self._count = 0           # files scanned so far
+        self._indeterminate = True
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self):
+        """Indeterminate: the database is loading and there is no progress to
+        report yet. Drawing motion here is the whole point — it distinguishes
+        'working' from 'hung'."""
+        self._indeterminate = True
+        self._filled = 0
+        self._count = 0
+        self._blocks = 0
+        self._phase = 0.0
+        if not self._timer.isActive():
+            self._timer.start(33)  # ~30 FPS, matching LatticeWidget
+        self.show()
+
+    def set_progress(self, count):
+        """Switch to determinate once files start arriving."""
+        self._indeterminate = False
+        self._count = count
+        # The total is unknown (a recursive walk has no denominator), so the
+        # fill advances on log2(count) and saturates: monotonic, never
+        # regresses on a re-tick, and still moving after a million files.
+        n = max(6, min(self.BLOCK_MAX, int(math.log2(max(count, 2)) * 3)))
+        self._blocks = n
+        self._filled = min(n, int(math.log2(max(count, 1) + 1) * 2))
+        self.update()
+
+    def finish(self):
+        self._timer.stop()
+        self._indeterminate = False
+        self.update()
+
+    def reset(self):
+        self._timer.stop()
+        self._blocks = 0
+        self._filled = 0
+        self._count = 0
+        self._indeterminate = True
+
+    def _tick(self):
+        self._phase = (self._phase + 0.08) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802 - Qt naming
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            p.end()
+            return
+
+        gap = 3
+        cy = h // 2
+        bh = max(6, h - 8)
+        by = cy - bh // 2
+
+        if self._indeterminate or self._blocks <= 0:
+            # Traveling highlight: a short band of bright blocks sweeping left
+            # to right, over dim rails. Reads as "loading", not as "stuck".
+            n = 24
+            bw = max(2, (w - gap * (n - 1)) // n)
+            center = (self._phase / (2 * math.pi)) * n
+            for i in range(n):
+                distance = abs(i - center)
+                if distance < 2.0:
+                    alpha = int(230 * (1 - distance / 2.0))
+                    p.setBrush(QColor(0, 229, 192, max(40, alpha)))
+                else:
+                    p.setBrush(QColor(0, 229, 192, 28))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawRoundedRect(i * (bw + gap), by, bw, bh, 2, 2)
+            p.end()
+            return
+
+        n = self._blocks
+        bw = max(2, (w - gap * (n - 1)) // n)
+        active = min(self._filled, n - 1)
+        breathe = (math.sin(self._phase) + 1) / 2  # 0..1
+
+        for i in range(n):
+            x = i * (bw + gap)
+            if i < active:
+                p.setBrush(QColor(0, 229, 192, 200))
+            elif i == active:
+                # Breathing leading block, plus layered glow identical to the
+                # lattice sparks so the motion language is shared.
+                p.setBrush(QColor(0, 229, 192, int(120 + 110 * breathe)))
+                p.setPen(Qt.PenStyle.NoPen)
+                for radius, alpha in ((6, 8), (3, 26)):
+                    p.setBrush(QColor(0, 229, 192, alpha))
+                    p.drawEllipse(x + bw // 2 - radius, cy - radius,
+                                  radius * 2, radius * 2)
+                p.setBrush(QColor(0, 229, 192, int(120 + 110 * breathe)))
+            else:
+                p.setBrush(QColor(255, 255, 255, 22))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(x, by, bw, bh, 2, 2)
+
+        p.end()
+
+
 # ============================================================
 # AUDIT WORKER (bakgrundstråd)
 # ============================================================
@@ -1310,6 +1437,21 @@ class AuditEngine:
 
     def stop(self):
         self._stop = True
+        # Setting the flag alone does not stop a virus scan: that loop blocks in
+        # `for line in proc.stdout`, which does not return until clamscan exits
+        # on its own — minutes or hours later. The flag is only observed in
+        # run()/collect(), i.e. *after* the future completes, so Stop appeared to
+        # do nothing. Keeping the handle lets stop() close the pipe directly.
+        proc = getattr(self, "_scan_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        # The feed overlay runs through _cmd, which returns only a completed
+        # result and holds no handle. It is guarded instead: _run_feed_scan
+        # checks _stop before starting, so a cancelled scan never spawns a
+        # second ClamAV walk that would outlive the stop.
 
     def _run_safe(self, section):
         try:
@@ -2436,6 +2578,7 @@ class AuditEngine:
             last_file = ""
             feed_threats = []
             feed_status = "not_requested"
+            _last_emit = 0.0
 
             # Prune package/build trees from the interactive walk. clamdscan
             # has no --exclude-dir, so this applies to clamscan only.
@@ -2447,6 +2590,11 @@ class AuditEngine:
             def _run_feed_scan():
                 """Run feed scan in background thread while main scan completes."""
                 nonlocal feed_threats, feed_status
+                # Do not open a second ClamAV walk for a scan the user already
+                # cancelled; it would outlive the stop and keep the disk busy.
+                if self._stop:
+                    feed_status = "cancelled"
+                    return
                 feed_path, feed_status = _fetch_extra_signatures()
                 if not feed_path:
                     return
@@ -2493,6 +2641,9 @@ class AuditEngine:
                     text=True,
                     bufsize=1,
                 )
+                # Published so stop() can terminate it; see stop() for why the
+                # _stop flag alone cannot interrupt the read loop below.
+                self._scan_proc = proc
 
                 # Start feed scan in background thread while main scan runs.
                 # PLAN.md Phase 7: second pass scoped to ONLY feed's database.
@@ -2502,6 +2653,8 @@ class AuditEngine:
 
                 # Batch progress updates every 100 files for performance (was per-file).
                 for line in proc.stdout:
+                    if self._stop:
+                        break
                     line = line.strip()
                     if not line:
                         continue
@@ -2518,15 +2671,45 @@ class AuditEngine:
                     # First file proves the database finished loading, which is
                     # the only feedback that distinguishes "loading" from
                     # "hung". Then batch every 100 (99% fewer UI callbacks).
-                    if files_scanned == 1 or files_scanned % 100 == 0:
+                    # Time-throttled as well as count-throttled. A pure
+                    # `% 100` gate means the first update after file #1 lands
+                    # 100 files later — minutes on a cold cache — while a
+                    # 1M-file tree would emit 10k callbacks. Either bound alone
+                    # is wrong, so emit on whichever comes first.
+                    now = time.monotonic()
+                    if (files_scanned == 1
+                            or files_scanned % 100 == 0
+                            or now - _last_emit > 0.1):
+                        _last_emit = now
                         short = last_file[-40:] if len(last_file) > 40 else last_file
                         self._on_progress(
                             f"Scanning {files_scanned} files… {short}", files_scanned
                         )
+
+                if self._stop:
+                    # Close the pipe for real, then escalate: terminate() on a
+                    # deep recursive walk can take a moment to be honoured.
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except Exception:  # noqa: BLE001
+                        try:
+                            proc.kill()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    self._scan_proc = None
+                    return "info", (f"Cancelled — stopped after {files_scanned} "
+                                    f"file(s).\nPartial results are not a clean "
+                                    f"bill of health: re-run to completion.")
+
                 proc.wait()
+                self._scan_proc = None
 
                 # Wait for feed scan to complete (should mostly overlap with main scan).
-                feed_thread.join(timeout=610)  # 600s timeout + 10s buffer
+                # Short join when stopping: the feed process was just told to
+                # terminate, and blocking here for the full 610s is what made
+                # Stop look unresponsive.
+                feed_thread.join(timeout=10 if self._stop else 610)
 
                 # PLAN.md Phase 10: the tag travels in the text itself
                 # because findings in this tool are one dict per SECTION
@@ -6111,6 +6294,15 @@ class SecurityAuditWindow(QMainWindow):
         self.btn_run_scan.clicked.connect(self._run_virus_scan)
         scan_tb_layout.addWidget(self.btn_run_scan)
 
+        self.scan_meter = ScanMeterWidget()
+        # Progress can arrive before the first explicit run (a restored
+        # session, or a scan started from the CLI bridge). _run_audit and
+        # _run_virus_scan reset this list, but neither has run yet at
+        # construction time, and _on_scan_progress appends unconditionally.
+        self._scan_log = []
+        self.scan_meter.hide()
+        scan_tb_layout.addWidget(self.scan_meter, stretch=1)
+
         self.btn_stop_scan = QPushButton("■  Stop")
         self.btn_stop_scan.setFixedWidth(70)
         self.btn_stop_scan.setEnabled(False)
@@ -6227,6 +6419,7 @@ class SecurityAuditWindow(QMainWindow):
         self.lbl_section_status.setStyleSheet(f"color:{COLORS['cyan']};font-size:10px;")
         self.btn_run_scan.setEnabled(False)
         self.btn_stop_scan.setEnabled(True)
+        self.scan_meter.start()
         self.scan_worker = AuditWorker([VIRUS_SECTION], scan_path=scan_path)
         self.scan_worker.section_done.connect(self._on_virus_scan_done)
         self.scan_worker.scan_progress.connect(self._on_scan_progress)
@@ -6235,14 +6428,20 @@ class SecurityAuditWindow(QMainWindow):
     def _stop_virus_scan(self):
         if hasattr(self, "scan_worker"):
             self.scan_worker.stop()
+        # The worker now terminates the subprocess, so the button can settle
+        # immediately instead of waiting for clamscan to honour the signal.
         self.btn_run_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
-        self.lbl_section_status.setText("Stopped")
+        self.lbl_section_status.setText("Stopping…")
+        self.scan_meter.finish()
 
     def _on_virus_scan_done(self, section, status, output):
         self.results[section] = (status, output)
+        self.scan_meter.finish()
         self.btn_run_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
+        if status == "info" and output.startswith("Cancelled"):
+            self.lbl_section_status.setText("Cancelled")
         self._show_output(status, output)
         self.btn_ai_fix.setEnabled(status in ("warn", "critical", "error"))
 
@@ -6289,6 +6488,11 @@ class SecurityAuditWindow(QMainWindow):
 
     def _on_scan_progress(self, label, count):
         self.lbl_status.setText(label)
+        # count == 0 is the pre-scan "Loading signature database" message; the
+        # meter stays indeterminate there because there is genuinely nothing
+        # to measure yet.
+        if count > 0:
+            self.scan_meter.set_progress(count)
         self._scan_log.append(label)
         idx = SECTIONS.index(VIRUS_SECTION)
         if self.section_list.currentRow() == idx:
