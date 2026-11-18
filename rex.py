@@ -58,7 +58,7 @@ QT_MISSING_MSG = (
 HAS_QT = False
 try:
     from PyQt6.QtCore import QByteArray, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap
+    from PyQt6.QtGui import QColor, QFontDatabase, QIcon, QPainter, QPalette, QPen, QPixmap
     from PyQt6.QtSvg import QSvgRenderer
     from PyQt6.QtWidgets import (
         QApplication,
@@ -245,7 +245,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.9"
+VERSION  = "1.9.10"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -759,25 +759,49 @@ LOCAL_PROVIDERS = ["ollama"]
 
 # Same design tokens as the ÆGIS Desktop (Electron) app's
 # desktop/renderer/style.css :root palette, so rex reads as the same product
-# in a different shell. cyan/teal was already an exact match; everything else
-# is now pulled onto the same navy-tinted bg/border/text scale.
+# in a different shell. First aligned 2026-09-25 ("navy-tinted"); the plugin's
+# palette drifted since, and PLAN.md Phase 18 (2026-11-18) re-anchored
+# bg/bg2/bg3/border/border2/text/text2/text3 to the plugin's CURRENT :root
+# values below. This is a CHROME-ONLY pass: it does not touch the monospace
+# font used for scan output/findings (a deliberate functional choice, not a
+# stale leftover), and cyan/cyan_dim/green/red/orange/white are deliberately
+# left untouched below — they were already exact matches, and re-deriving
+# the brand accent from this palette would be the exact "helpfully redo the
+# accent colour" mistake this project's own CHANGELOG already warned against
+# once (the website's nav bar).
 COLORS = {
-    "bg":        "#0a0e14",
-    "bg2":       "#12161e",
-    "bg3":       "#181e28",
-    "border":    "#2a3342",
-    "border2":   "#3d4a5e",
+    "bg":        "#070708",
+    "bg2":       "#0d0d10",
+    "bg3":       "#131317",
+    "border":    "rgba(255,255,255,0.1)",
+    "border2":   "rgba(255,255,255,0.1)",
     "cyan":      "#00e5c0",
     "cyan_dim":  "#00b89a",
     "purple":    "#6b8fd4",
-    "text":      "#d0dfee",
-    "text2":     "#7e9ab8",
-    "text3":     "#3a4a60",
+    "text":      "#d4d4d8",
+    "text2":     "#9d9d9d",
+    "text3":     "#6e6e6e",
     "green":     "#00ff88",
     "red":       "#ff1744",
     "orange":    "#ff9100",
     "white":     "#ffffff",
 }
+
+
+def _display_font_stack():
+    """The plugin's --font-display ('Syne'), for headings/wordmark/button
+    chrome only — PLAN.md Phase 18. The plugin's own stylesheet documents
+    Syne as illegible below 14px (a display face with wide, low-contrast
+    letterforms that close up at small sizes), so this must only be used
+    for >=14px labels, never for rex's 10-11px secondary labels. Falls back
+    to rex's existing monospace stack when Syne isn't installed — Qt
+    silently substitutes a default font for an unknown family name rather
+    than erroring, so availability is checked explicitly here instead of
+    trusting Qt to degrade sensibly on its own."""
+    if HAS_QT and "Syne" in QFontDatabase.families():
+        return "'Syne', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace"
+    return "'JetBrains Mono', 'Fira Mono', 'Courier New', monospace"
+
 
 AUDIT_SECTIONS = [
     "System Info",
@@ -5204,7 +5228,7 @@ class RemediationDialog(QDialog):
                          font-family:'JetBrains Mono','Fira Mono',monospace;
                          font-size:12px; padding:8px; }}
             QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
-                           border:1px solid {COLORS['border']}; border-radius:6px;
+                           border:1px solid {COLORS['border']}; border-radius:14px;
                            padding:7px 18px; font-size:12px; }}
             QPushButton#apply {{ background:{COLORS['cyan']}; color:#04140f;
                                  font-weight:bold; border:none; }}
@@ -5394,7 +5418,7 @@ class PlanDialog(QDialog):
                          font-family:'JetBrains Mono','Fira Mono',monospace;
                          font-size:12px; padding:8px; }}
             QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
-                           border:1px solid {COLORS['border']}; border-radius:6px;
+                           border:1px solid {COLORS['border']}; border-radius:14px;
                            padding:7px 18px; font-size:12px; }}
             QPushButton#apply {{ background:{COLORS['cyan']}; color:#04140f;
                                  font-weight:bold; border:none; }}
@@ -5557,7 +5581,10 @@ class SecurityAuditWindow(QMainWindow):
                 background: {COLORS['bg3']};
                 color: {COLORS['text']};
                 border: 1px solid {COLORS['border']};
-                border-radius: 6px;
+                /* Pill radius = half this button's own ~24px fixed height
+                   (6px padding x2 + ~12px line-height), same math as
+                   SignInDialog's pill (PLAN.md Phase 15/18). */
+                border-radius: 12px;
                 padding: 6px 14px;
                 font-size: 11px;
             }}
@@ -5602,6 +5629,7 @@ class SecurityAuditWindow(QMainWindow):
             }}
             QLabel#title {{
                 color: {COLORS['cyan']};
+                font-family: {_display_font_stack()};
                 font-size: 16px;
                 font-weight: bold;
                 letter-spacing: 2px;
@@ -5809,7 +5837,8 @@ class SecurityAuditWindow(QMainWindow):
 
         self.lbl_section = QLabel("Select a section →")
         self.lbl_section.setStyleSheet(
-            f"color: {COLORS['cyan']}; font-size: 14px; font-weight: bold;"
+            f"color: {COLORS['cyan']}; font-family: {_display_font_stack()}; "
+            f"font-size: 14px; font-weight: bold;"
         )
         main_layout.addWidget(self.lbl_section)
 
