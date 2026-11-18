@@ -61,6 +61,7 @@ try:
     from PyQt6.QtCore import QByteArray, Qt, QThread, QTimer, pyqtSignal
     from PyQt6.QtGui import (
         QColor,
+        QFont,
         QFontDatabase,
         QIcon,
         QPainter,
@@ -844,19 +845,65 @@ COLORS = {
 }
 
 
+def _installed_font_families():
+    """Installed font families, or an empty set when Qt can't be queried.
+
+    QFontDatabase.families() does not raise without a live QApplication -- it
+    aborts the whole process -- so every family probe goes through here. A
+    missing application must degrade to the fallback stack, never take the
+    process down (this bites headless tests and --audit paths alike)."""
+    if not HAS_QT:
+        return set()
+    try:
+        if QApplication.instance() is None:
+            return set()
+        return set(QFontDatabase.families())
+    except Exception:
+        return set()
+
+
+def _ui_font_stack():
+    """Proportional face for chrome, labels, buttons and dialogs.
+
+    'Ubuntu' is the platform face, installed by default on every Ubuntu host,
+    so rex renders in the system's own typeface instead of whatever Qt happens
+    to substitute. The old stack led with 'DM Mono', which is NOT installed
+    here: Qt silently swaps unknown families for a generic default, so rex had
+    been rendering in an accidental fallback rather than the intended face.
+
+    Chrome is deliberately proportional rather than mono; the monospace face
+    is reserved for scan output and findings, where column alignment is
+    functional rather than decorative."""
+    if "Ubuntu" in _installed_font_families():
+        return "'Ubuntu', 'Ubuntu Sans', 'DejaVu Sans', sans-serif"
+    return "'Ubuntu Sans', 'DejaVu Sans', sans-serif"
+
+
+def _mono_font_stack():
+    """Monospace face for scan output, findings and report HTML.
+
+    Monospace is a functional choice here, not decoration: the audit log and
+    findings render in fixed columns and proportional text would destroy that
+    alignment. 'Ubuntu Mono' keeps it in the same family as the chrome so the
+    output still reads as one product."""
+    if "Ubuntu Mono" in _installed_font_families():
+        return ("'Ubuntu Mono', 'Ubuntu Sans Mono', 'DejaVu Sans Mono', "
+                "'Liberation Mono', monospace")
+    return "'Ubuntu Sans Mono', 'DejaVu Sans Mono', 'Liberation Mono', monospace"
+
+
 def _display_font_stack():
-    """The plugin's --font-display ('Syne'), for headings/wordmark/button
-    chrome only — PLAN.md Phase 18. The plugin's own stylesheet documents
-    Syne as illegible below 14px (a display face with wide, low-contrast
-    letterforms that close up at small sizes), so this must only be used
-    for >=14px labels, never for rex's 10-11px secondary labels. Falls back
-    to rex's existing monospace stack when Syne isn't installed — Qt
-    silently substitutes a default font for an unknown family name rather
-    than erroring, so availability is checked explicitly here instead of
-    trusting Qt to degrade sensibly on its own."""
-    if HAS_QT and "Syne" in QFontDatabase.families():
-        return "'Syne', 'DM Mono', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace"
-    return "'DM Mono', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace"
+    """Headings/wordmark/button chrome -- PLAN.md Phase 18.
+
+    The plugin's stylesheet documents its display face (Syne) as illegible
+    below 14px -- wide, low-contrast letterforms close up at small sizes -- so
+    this must only be used for >=14px labels, never rex's 10-11px secondary
+    text. Syne is not installed on stock Ubuntu, so the effective result is the
+    Ubuntu UI stack; the branch is kept so a host that does have Syne still
+    gets the intended display face."""
+    if "Syne" in _installed_font_families():
+        return "'Syne', 'Ubuntu', 'Ubuntu Sans', 'DejaVu Sans', sans-serif"
+    return _ui_font_stack()
 
 
 AUDIT_SECTIONS = [
@@ -5603,7 +5650,7 @@ class RemediationDialog(QDialog):
             QLabel    {{ color:{COLORS['text']}; font-size:12px; }}
             QTextEdit {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                          border:1px solid {COLORS['border']}; border-radius:6px;
-                         font-family:'DM Mono','JetBrains Mono','Fira Mono',monospace;
+                         font-family:{_mono_font_stack()};
                          font-size:12px; padding:8px; }}
             QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                            border:1px solid {COLORS['border']}; border-radius:14px;
@@ -5796,7 +5843,7 @@ class PlanDialog(QDialog):
             QLabel    {{ color:{COLORS['text']}; font-size:12px; }}
             QTextEdit {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                          border:1px solid {COLORS['border']}; border-radius:6px;
-                         font-family:'DM Mono','JetBrains Mono','Fira Mono',monospace;
+                         font-family:{_mono_font_stack()};
                          font-size:12px; padding:8px; }}
             QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                            border:1px solid {COLORS['border']}; border-radius:14px;
@@ -5929,7 +5976,7 @@ class SecurityAuditWindow(QMainWindow):
             QMainWindow, QWidget {{
                 background-color: {COLORS['bg']};
                 color: {COLORS['text']};
-                font-family: 'DM Mono', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace;
+                font-family: {_ui_font_stack()};
                 font-size: 12px;
             }}
             QScrollBar:vertical {{
@@ -6004,7 +6051,7 @@ class SecurityAuditWindow(QMainWindow):
                 border: 1px solid {COLORS['border']};
                 border-radius: 8px;
                 padding: 10px;
-                font-family: 'DM Mono', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace;
+                font-family: {_mono_font_stack()};
                 font-size: 13px;
                 line-height: 1.5;
             }}
@@ -6381,7 +6428,7 @@ class SecurityAuditWindow(QMainWindow):
             else:
                 html_lines.append(f'<span style="color:{COLORS["text"]}">{line}</span>')
         html = (
-            f'<div style="font-family:\'DM Mono\',\'JetBrains Mono\',\'Fira Mono\',monospace;'
+            f'<div style="font-family:{_mono_font_stack()};'
             f'font-size:13px;line-height:1.7;background:{COLORS["bg2"]};'
             f'color:{COLORS["text"]};padding:4px">'
             + "<br>".join(html_lines)
@@ -6563,7 +6610,7 @@ class SecurityAuditWindow(QMainWindow):
 
         if not warnings:
             self.output_view.setHtml(
-                f'<div style="font-family:\'DM Mono\',\'JetBrains Mono\',\'Fira Mono\',monospace;'
+                f'<div style="font-family:{_mono_font_stack()};'
                 f'background:{COLORS["bg2"]};color:{COLORS["text"]};padding:4px">'
                 + score_html
                 + f'<div style="color:{COLORS["green"]};font-size:13px;font-weight:bold">'
@@ -6598,7 +6645,7 @@ class SecurityAuditWindow(QMainWindow):
             )
 
         self.output_view.setHtml(
-            f'<div style="font-family:\'DM Mono\',\'JetBrains Mono\',\'Fira Mono\',monospace;'
+            f'<div style="font-family:{_mono_font_stack()};'
             f'background:{COLORS["bg2"]};color:{COLORS["text"]};padding:4px">'
             + "".join(lines) + "</div>"
         )
@@ -6770,6 +6817,18 @@ def main(argv=None):
         return EXIT_USAGE
 
     app = QApplication(sys.argv)
+    # Set the family app-wide (preserving the default point size) so dialogs and
+    # widgets without an explicit stylesheet inherit Ubuntu rather than Qt's
+    # generic default. QFontDatabase needs a live QApplication -- it aborts the
+    # process rather than raising when there isn't one -- so this is skipped
+    # when a test has substituted a stand-in application object.
+    _families = _installed_font_families()
+    if _families:
+        _af = app.font()
+        _af.setFamily("Ubuntu" if "Ubuntu" in _families
+                      else ("Ubuntu Sans" if "Ubuntu Sans" in _families
+                            else _af.family()))
+        app.setFont(_af)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)
     cfg = _load_config()

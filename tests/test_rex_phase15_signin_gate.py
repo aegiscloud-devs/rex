@@ -49,6 +49,14 @@ def test_signin_dialog_and_qapplication_unreachable_from_cli_main():
 # main()'s gating: shown once per profile, never blocks the audit window
 # --------------------------------------------------------------------------
 
+class _FakeFont:
+    def setFamily(self, *a):
+        pass
+
+    def family(self):
+        return "Fake"
+
+
 class _FakeApp:
     def __init__(self, argv):
         pass
@@ -57,6 +65,15 @@ class _FakeApp:
         pass
 
     def setApplicationVersion(self, *a):
+        pass
+
+    # main() sets the app-wide font so dialogs inherit Ubuntu instead of Qt's
+    # generic default. A stand-in QApplication must answer font()/setFont() or
+    # it is not a faithful double.
+    def font(self):
+        return _FakeFont()
+
+    def setFont(self, *a):
         pass
 
     def exec(self):
