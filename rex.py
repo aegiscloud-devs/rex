@@ -58,7 +58,15 @@ QT_MISSING_MSG = (
 HAS_QT = False
 try:
     from PyQt6.QtCore import QByteArray, Qt, QThread, QTimer, pyqtSignal
-    from PyQt6.QtGui import QColor, QFontDatabase, QIcon, QPainter, QPalette, QPen, QPixmap
+    from PyQt6.QtGui import (
+        QColor,
+        QFontDatabase,
+        QIcon,
+        QPainter,
+        QPalette,
+        QPen,
+        QPixmap,
+    )
     from PyQt6.QtSvg import QSvgRenderer
     from PyQt6.QtWidgets import (
         QApplication,
