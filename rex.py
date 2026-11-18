@@ -5546,6 +5546,7 @@ class SecurityAuditWindow(QMainWindow):
         self._apply_theme()
         self._build_ui()
         self._restore_config()
+        self._update_account_status()
 
     def _restore_config(self):
         cfg = _load_config()
@@ -5860,6 +5861,29 @@ class SecurityAuditWindow(QMainWindow):
                                "plan (fail2ban/ClamAV/DNS) — same engine as --plan")
         sb.addWidget(btn_fix_all)
         self.btn_fix_all = btn_fix_all
+
+        sb.addSpacing(12)
+
+        # ── ACCOUNT ──────────────────────────────────────────
+        lbl_account = QLabel("Account")
+        lbl_account.setStyleSheet(f"color:{COLORS['text3']};font-size:10px;letter-spacing:1px;")
+        sb.addWidget(lbl_account)
+
+        self.lbl_account_status = QLabel("Not signed in")
+        self.lbl_account_status.setStyleSheet(f"color:{COLORS['text3']};font-size:10px;")
+        self.lbl_account_status.setWordWrap(True)
+        sb.addWidget(self.lbl_account_status)
+
+        btn_sign_in = QPushButton("🔑  Sign In")
+        btn_sign_in.clicked.connect(self._open_sign_in)
+        sb.addWidget(btn_sign_in)
+        self.btn_sign_in = btn_sign_in
+
+        btn_sign_out = QPushButton("🚪  Sign Out")
+        btn_sign_out.clicked.connect(self._sign_out)
+        btn_sign_out.setEnabled(False)
+        sb.addWidget(btn_sign_out)
+        self.btn_sign_out = btn_sign_out
 
         sb.addStretch()
         root.addWidget(sidebar)
@@ -6265,6 +6289,37 @@ class SecurityAuditWindow(QMainWindow):
                 QMessageBox.information(self, "Fix All — result", dlg.applied_output[:4000])
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Fix All Error", str(e))
+
+    def _update_account_status(self):
+        cfg = _load_config()
+        has_key = bool(cfg.get("aegis_api_key"))
+        if has_key:
+            self.lbl_account_status.setText("✓ Signed in")
+            self.lbl_account_status.setStyleSheet(f"color:{COLORS['green']};font-size:10px;")
+            self.btn_sign_in.setEnabled(False)
+            self.btn_sign_out.setEnabled(True)
+        else:
+            self.lbl_account_status.setText("Not signed in")
+            self.lbl_account_status.setStyleSheet(f"color:{COLORS['text3']};font-size:10px;")
+            self.btn_sign_in.setEnabled(True)
+            self.btn_sign_out.setEnabled(False)
+
+    def _open_sign_in(self):
+        dlg = SignInDialog()
+        dlg.exec()
+        self._update_account_status()
+
+    def _sign_out(self):
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "Sign Out",
+            "Remove your AEGIS Cloud key?\n\nYou'll need to sign in again to submit malware reports.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            _save_config({"aegis_api_key": None})
+            self._update_account_status()
+            QMessageBox.information(self, "Signed Out", "Your AEGIS Cloud key has been removed.")
 
     def _export(self):
         path, _ = QFileDialog.getSaveFileName(
