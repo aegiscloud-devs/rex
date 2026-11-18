@@ -253,7 +253,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.11"
+VERSION  = "1.9.12"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -5252,10 +5252,13 @@ class RemediationDialog(QDialog):
             QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                            border:1px solid {COLORS['border']}; border-radius:14px;
                            padding:7px 18px; font-size:12px; }}
-            QPushButton#apply {{ background:{COLORS['cyan']}; color:#ffffff;
+            QPushButton#apply {{ background:{COLORS['cyan']}; color:#04140f;
                                  font-weight:bold; border:none; }}
-            QPushButton:hover  {{ border-color:{COLORS['cyan']}; color:{COLORS['cyan']}; }}
-            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#ffffff; }}
+            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#04140f; }}
+            QPushButton#apply:pressed {{ background:#0a4a3d; color:#04140f; }}
+            QPushButton:hover  {{ border-color:{COLORS['cyan']}; color:{COLORS['cyan']};
+                                 background: rgba(0, 229, 192, 8); }}
+            QPushButton:pressed {{ background: rgba(0, 229, 192, 12); }}
             QPushButton:disabled {{ color:{COLORS['text3']}; border-color:{COLORS['bg3']}; }}
         """)
 
@@ -5442,10 +5445,13 @@ class PlanDialog(QDialog):
             QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                            border:1px solid {COLORS['border']}; border-radius:14px;
                            padding:7px 18px; font-size:12px; }}
-            QPushButton#apply {{ background:{COLORS['cyan']}; color:#ffffff;
+            QPushButton#apply {{ background:{COLORS['cyan']}; color:#04140f;
                                  font-weight:bold; border:none; }}
-            QPushButton:hover  {{ border-color:{COLORS['cyan']}; color:{COLORS['cyan']}; }}
-            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#ffffff; }}
+            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#04140f; }}
+            QPushButton#apply:pressed {{ background:#0a4a3d; color:#04140f; }}
+            QPushButton:hover  {{ border-color:{COLORS['cyan']}; color:{COLORS['cyan']};
+                                 background: rgba(0, 229, 192, 8); }}
+            QPushButton:pressed {{ background: rgba(0, 229, 192, 12); }}
             QPushButton:disabled {{ color:{COLORS['text3']}; border-color:{COLORS['bg3']}; }}
         """)
 
@@ -5613,6 +5619,10 @@ class SecurityAuditWindow(QMainWindow):
             QPushButton:hover {{
                 border-color: {COLORS['cyan']};
                 color: {COLORS['cyan']};
+                background: rgba(0, 229, 192, 8);
+            }}
+            QPushButton:pressed {{
+                background: rgba(0, 229, 192, 12);
             }}
             QPushButton:disabled {{
                 color: {COLORS['text3']};
@@ -5620,13 +5630,16 @@ class SecurityAuditWindow(QMainWindow):
             }}
             QPushButton#btn_run {{
                 background: {COLORS['cyan']};
-                color: #ffffff;
+                color: #04140f;
                 font-weight: bold;
                 border: none;
             }}
             QPushButton#btn_run:hover {{
                 background: {COLORS['cyan_dim']};
-                color: #ffffff;
+                color: #04140f;
+            }}
+            QPushButton#btn_run:pressed {{
+                background: #0a4a3d;
             }}
             QTextEdit {{
                 background: {COLORS['bg2']};
