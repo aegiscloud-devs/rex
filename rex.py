@@ -778,35 +778,26 @@ LOCAL_PROVIDERS = ["ollama"]
 # accent colour" mistake this project's own CHANGELOG already warned against
 # once (the website's nav bar).
 COLORS = {
-    # UIX upgrade (post-PLAN.md, 2026) — re-anchored a second time, this
-    # pass away from aegiscode-plugin's dark chrome and onto aegisone's
-    # actual web palette (aegis1/templates/aegis-one.html :root). bg/bg2/bg3,
-    # border/border2 and text/text2/text3 are aegisone's --bg/--surface/
-    # --surface2, --border/--border2 and --text/--muted/--muted2 verbatim.
-    # cyan/cyan_dim is aegisone's --accent2 (#0F6E56, its own primary CTA
-    # color) plus a darkened hover shade computed the same way as the old
-    # cyan/cyan_dim pair; purple is aegisone's --accent (#534AB7) — unused
-    # by name elsewhere in this file, kept for parity with aegisone's own
-    # two-accent system rather than left pointing at an unrelated blue.
-    # green/orange/red are deliberately NOT borrowed from aegisone, which
-    # has no severity language of its own (no warn/critical concept) — a
-    # security audit's pass/warn/critical triad has to stay mutually
-    # distinct and legible on a white background, so these are tuned for
-    # that job specifically rather than re-derived from marketing copy.
-    "bg":        "#ffffff",
-    "bg2":       "#f8f8f6",
-    "bg3":       "#f2f2ef",
-    "border":    "#e8e8e4",
-    "border2":   "#d8d8d4",
-    "cyan":      "#0F6E56",
-    "cyan_dim":  "#0d5e49",
+    # UIX upgrade (post-PLAN.md, 2026) — dark desktop theme with aegisone's
+    # design language. bg/bg2/bg3 and text hierarchy stay dark for desktop
+    # readability and contrast. purple added as aegisone's --accent (#534AB7)
+    # for future use in design elements that benefit from a second brand accent.
+    # cyan/cyan_dim keep the bright teal that works on dark backgrounds.
+    # green/orange/red are tuned for legibility on the dark background.
+    "bg":        "#070708",
+    "bg2":       "#0d0d10",
+    "bg3":       "#131317",
+    "border":    "rgba(255,255,255,0.1)",
+    "border2":   "rgba(255,255,255,0.1)",
+    "cyan":      "#00e5c0",
+    "cyan_dim":  "#00b89a",
     "purple":    "#534AB7",
-    "text":      "#111110",
-    "text2":     "#6b6b68",
-    "text3":     "#9b9b98",
-    "green":     "#1f8a4c",
-    "red":       "#c0392b",
-    "orange":    "#b36b00",
+    "text":      "#d4d4d8",
+    "text2":     "#9d9d9d",
+    "text3":     "#6e6e6e",
+    "green":     "#00ff88",
+    "red":       "#ff1744",
+    "orange":    "#ff9100",
     "white":     "#ffffff",
 }
 
@@ -5105,7 +5096,7 @@ class SignInDialog(QDialog):
         pill = 20
         self.setStyleSheet(f"""
             QDialog {{ background:{COLORS['bg']}; }}
-            QLabel#glyph  {{ color:{COLORS['purple']}; font-size:40px; font-weight:800; }}
+            QLabel#glyph  {{ color:{COLORS['text']}; font-size:40px; font-weight:800; }}
             QLabel#title  {{ color:{COLORS['text']}; font-size:17px; font-weight:600; }}
             QLabel#sub    {{ color:{COLORS['text2']}; font-size:12px; }}
             QLabel#status {{ color:{COLORS['text2']}; font-size:11px; min-height:14px; }}
@@ -5114,11 +5105,12 @@ class SignInDialog(QDialog):
                            font-size:13px; font-weight:600; padding:11px 16px; }}
             QPushButton#google {{ background:{self.GOOGLE_BLUE}; border-color:{self.GOOGLE_BLUE};
                                   color:#ffffff; }}
-            QPushButton#key {{ border-color:{COLORS['purple']}; color:{COLORS['purple']}; }}
-            QPushButton#key:hover {{ background:{COLORS['purple']}; color:#ffffff; }}
+            QPushButton#key {{ border-color:{COLORS['cyan']}; color:{COLORS['cyan']}; }}
+            QPushButton#key:hover {{ background:{COLORS['cyan']}; color:#04140f; }}
             QPushButton#verify {{ background:{COLORS['cyan']}; border-color:{COLORS['cyan']};
-                                 color:#ffffff; }}
-            QPushButton#verify:hover {{ background:{COLORS['cyan_dim']}; border-color:{COLORS['cyan_dim']}; }}
+                                 color:#04140f; }}
+            QPushButton#verify:hover {{ background:{COLORS['cyan_dim']}; border-color:{COLORS['cyan_dim']};
+                                        color:#04140f; }}
             QPushButton#skip {{ background:transparent; border:none; font-weight:normal;
                                 color:{COLORS['text3']}; font-size:11px; padding:4px; }}
             QPushButton:disabled {{ color:{COLORS['text3']}; border-color:{COLORS['border']}; }}
@@ -6060,10 +6052,10 @@ class SecurityAuditWindow(QMainWindow):
             "error":    COLORS["red"],
         }
         bg_map = {
-            "ok":       "#eaf6ef",
-            "warn":     "#fbf1e0",
-            "critical": "#fbeae8",
-            "error":    "#fbeae8",
+            "ok":       "#0a1a0a",
+            "warn":     "#1f1200",
+            "critical": "#1f0000",
+            "error":    "#1f0000",
         }
         prefix_map = {
             "ok":       "✓ ",
