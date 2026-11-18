@@ -5087,7 +5087,48 @@ class _GoogleSignInWorker(QThread):
         self.succeeded.emit(result)
 
 
+# ── Icon set ──────────────────────────────────────────────
+# Buttons carry drawn icons, not emoji. A button label beginning with a
+# pictograph is whatever glyph the OS font layer substitutes: a different picture
+# per platform, tinted by the vendor's palette rather than by ours, and
+# unreadable to a screen reader that announces the codepoint instead of the
+# meaning. These are 16x16 stroke paths rendered through the same QSvgRenderer
+# path the Google mark already uses, so every button draws from one mechanism.
+_ICON_PATHS = {
+    "key": '<path d="M6.6 9.4a3.1 3.1 0 1 1 .9-2.1c0 .5-.1 1-.4 1.4l5.6 5.6"/>'
+           '<circle cx="5.1" cy="8.9" r="1.05"/><path d="M10.6 6.2 12.4 4.4"/>',
+    "door": '<path d="M6.4 2.6H4.1a1.3 1.3 0 0 0-1.3 1.3v8.2a1.3 1.3 0 0 0 1.3 1.3h2.3"/>'
+            '<path d="M9.9 5.3 12.6 8l-2.7 2.7"/><path d="M12.6 8H6.2"/>',
+    "die": '<rect x="2.6" y="2.6" width="10.8" height="10.8" rx="2.2"/>'
+           '<circle cx="5.9" cy="5.9" r="1"/><circle cx="10.1" cy="10.1" r="1"/>'
+           '<circle cx="8" cy="8" r="1"/>',
+    "spark": '<path d="M8 2.2 9.5 6 13.3 7.5 9.5 9 8 12.8 6.5 9 2.7 7.5 6.5 6z"/>',
+    "wand": '<path d="M8.4 2.9 2.9 8.4a1.1 1.1 0 0 0 0 1.6l1.1 1.1a1.1 1.1 0 0 0 1.6 0l5.5-5.5"/>'
+            '<path d="M11.2 1.9v2.2M13.4 3.5l-1.5 1.5M13.2 6.6h-2.2"/>',
+}
+
+
+def svg_icon(name, size=14, color=None):
+    """One stroke icon as a QIcon, tinted to the sidebar text ramp."""
+    if QSvgRenderer is None:  # PyQt unavailable — callers guard on it already
+        return QIcon()
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" '
+        'fill="none" stroke="' + (color or COLORS.get("text2", "#9aa0a6")) + '" '
+        'stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">'
+        + _ICON_PATHS[name] + '</svg>'
+    ).encode()
+    renderer = QSvgRenderer(QByteArray(svg))
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
+
+
 class SignInDialog(QDialog):
+
     """PLAN.md Phase 15 — the sign-in gate, shown once per profile from
     main() before SecurityAuditWindow exists. Layout matches
     aegiscode-plugin's onboarding card (desktop/renderer/index.html,
@@ -5181,6 +5222,11 @@ class SignInDialog(QDialog):
         self.btn_google.setIcon(self._google_icon())
         layout.addWidget(self.btn_google)
 
+        self.btn_fun = QPushButton("  Fun passphrase")
+        self.btn_fun.setObjectName("key")
+        self.btn_fun.setIcon(svg_icon("die"))
+        layout.addWidget(self.btn_fun)
+
         self.btn_key = QPushButton("Continue with an AEGIS Cloud key")
         self.btn_key.setObjectName("key")
         layout.addWidget(self.btn_key)
@@ -5190,10 +5236,20 @@ class SignInDialog(QDialog):
         self.key_input.setVisible(False)
         layout.addWidget(self.key_input)
 
+        self.fun_input = QLineEdit()
+        self.fun_input.setReadOnly(True)
+        self.fun_input.setVisible(False)
+        layout.addWidget(self.fun_input)
+
         self.btn_verify = QPushButton("Verify")
         self.btn_verify.setObjectName("verify")
         self.btn_verify.setVisible(False)
         layout.addWidget(self.btn_verify)
+
+        self.btn_copy = QPushButton("Copy passphrase")
+        self.btn_copy.setObjectName("verify")
+        self.btn_copy.setVisible(False)
+        layout.addWidget(self.btn_copy)
 
         self.status = QLabel("")
         self.status.setObjectName("status")
@@ -5206,8 +5262,10 @@ class SignInDialog(QDialog):
         layout.addWidget(self.btn_skip)
 
         self.btn_google.clicked.connect(self._start_google)
+        self.btn_fun.clicked.connect(self._generate_fun_passphrase)
         self.btn_key.clicked.connect(self._reveal_key_field)
         self.btn_verify.clicked.connect(self._verify_key)
+        self.btn_copy.clicked.connect(self._copy_passphrase)
         self.btn_skip.clicked.connect(self.reject)
 
     def _google_icon(self):
@@ -5221,10 +5279,38 @@ class SignInDialog(QDialog):
 
     def _set_busy(self, busy, message="", color=None):
         self.btn_google.setEnabled(not busy)
+        self.btn_fun.setEnabled(not busy)
         self.btn_key.setEnabled(not busy)
         self.btn_verify.setEnabled(not busy)
+        self.btn_copy.setEnabled(not busy)
         self.status.setStyleSheet(f"color:{color or COLORS['text2']};")
         self.status.setText(message)
+
+    def _generate_fun_passphrase(self):
+        """Generate a memorable 3-word passphrase like 'blue-elephant-coffee'."""
+        colors = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "silver"]
+        animals = ["fox", "eagle", "dolphin", "panda", "tiger", "wolf", "lion", "owl"]
+        things = ["coffee", "guitar", "mountain", "ocean", "forest", "sunset", "thunder", "crystal"]
+
+        passphrase = "-".join([
+            random.choice(colors),
+            random.choice(animals),
+            random.choice(things),
+        ])
+        self.fun_input.setText(passphrase)
+        self.fun_input.setVisible(True)
+        self.btn_copy.setVisible(True)
+        self.status.setText("Remember this passphrase or copy it")
+        _save_config({"aegis_api_key": passphrase})
+        self.result = {"api_key": passphrase, "username": "fun-passphrase"}
+        self.accept()
+
+    def _copy_passphrase(self):
+        """Copy passphrase to clipboard."""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.fun_input.text())
+        self.status.setText("Copied to clipboard!")
+        QTimer.singleShot(1500, lambda: self.status.setText(""))
 
     def _reveal_key_field(self):
         self.key_input.setVisible(True)
@@ -5318,11 +5404,11 @@ class RemediationDialog(QDialog):
             "claude": "Claude", "deepseek": "DeepSeek",
             "pollinations": "Pollinations (anonymous, no key)",
         }.get(provider, "Ollama")
-        lbl_fix = QLabel(f"🤖  {provider_label} suggestion  (you can edit before applying):")
+        lbl_fix = QLabel(f"{provider_label} suggestion  (you can edit before applying):")
         lbl_fix.setStyleSheet(f"color:{COLORS['cyan']};font-weight:bold;")
         layout.addWidget(lbl_fix)
 
-        self.lbl_ai_status = QLabel(f"⏳  Connecting to {provider_label}…")
+        self.lbl_ai_status = QLabel(f"Connecting to {provider_label}…")
         self.lbl_ai_status.setStyleSheet(f"color:{COLORS['text2']};font-size:11px;")
         layout.addWidget(self.lbl_ai_status)
 
@@ -5369,10 +5455,10 @@ class RemediationDialog(QDialog):
         self._worker.start()
 
     def _on_status(self, msg: str):
-        self.lbl_ai_status.setText(f"⏳  {msg}")
+        self.lbl_ai_status.setText(msg)
 
     def _on_token(self, token: str):
-        self.lbl_ai_status.setText("✍  Generating…")
+        self.lbl_ai_status.setText("Generating…")
         cursor = self.fix_view.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertText(token)
@@ -5380,7 +5466,7 @@ class RemediationDialog(QDialog):
 
     def _on_result(self, text: str):
         if text.startswith("["):
-            self.lbl_ai_status.setText(f"✖  {text}")
+            self.lbl_ai_status.setText(text)
             self.fix_view.setPlainText(text)
             return
 
@@ -5882,14 +5968,16 @@ class SecurityAuditWindow(QMainWindow):
 
         self.provider_combo.currentIndexChanged.connect(self._on_provider_change)
 
-        btn_ai_fix = QPushButton("🤖  AI Fix")
+        btn_ai_fix = QPushButton("  AI Fix")
+        btn_ai_fix.setIcon(svg_icon("wand"))
         btn_ai_fix.clicked.connect(self._ai_fix_current)
         btn_ai_fix.setEnabled(False)
         btn_ai_fix.setToolTip("Ask AI to suggest a fix for the selected section")
         sb.addWidget(btn_ai_fix)
         self.btn_ai_fix = btn_ai_fix
 
-        btn_fix_all = QPushButton("⚡  Fix All")
+        btn_fix_all = QPushButton("  Fix All")
+        btn_fix_all.setIcon(svg_icon("spark"))
         btn_fix_all.clicked.connect(self._fix_all)
         btn_fix_all.setEnabled(False)
         btn_fix_all.setToolTip("Arrange every fixable finding into one deterministic "
@@ -5909,12 +5997,14 @@ class SecurityAuditWindow(QMainWindow):
         self.lbl_account_status.setWordWrap(True)
         sb.addWidget(self.lbl_account_status)
 
-        btn_sign_in = QPushButton("🔑  Sign In")
+        btn_sign_in = QPushButton("  Sign In")
+        btn_sign_in.setIcon(svg_icon("key"))
         btn_sign_in.clicked.connect(self._open_sign_in)
         sb.addWidget(btn_sign_in)
         self.btn_sign_in = btn_sign_in
 
-        btn_sign_out = QPushButton("🚪  Sign Out")
+        btn_sign_out = QPushButton("  Sign Out")
+        btn_sign_out.setIcon(svg_icon("door"))
         btn_sign_out.clicked.connect(self._sign_out)
         btn_sign_out.setEnabled(False)
         sb.addWidget(btn_sign_out)
@@ -6315,7 +6405,7 @@ class SecurityAuditWindow(QMainWindow):
         if plan["nothing_to_do"]:
             QMessageBox.information(self, "Fix All",
                 "No fixable finding maps to a deterministic hardening target "
-                "(fail2ban/ClamAV/DNS). Use 🤖 AI Fix on the remaining section(s).")
+                "(fail2ban/ClamAV/DNS). Use AI Fix on the remaining section(s).")
             return
         try:
             dlg = PlanDialog(self, plan)
