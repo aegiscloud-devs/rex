@@ -253,7 +253,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.10"
+VERSION  = "1.9.11"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -778,20 +778,35 @@ LOCAL_PROVIDERS = ["ollama"]
 # accent colour" mistake this project's own CHANGELOG already warned against
 # once (the website's nav bar).
 COLORS = {
-    "bg":        "#070708",
-    "bg2":       "#0d0d10",
-    "bg3":       "#131317",
-    "border":    "rgba(255,255,255,0.1)",
-    "border2":   "rgba(255,255,255,0.1)",
-    "cyan":      "#00e5c0",
-    "cyan_dim":  "#00b89a",
-    "purple":    "#6b8fd4",
-    "text":      "#d4d4d8",
-    "text2":     "#9d9d9d",
-    "text3":     "#6e6e6e",
-    "green":     "#00ff88",
-    "red":       "#ff1744",
-    "orange":    "#ff9100",
+    # UIX upgrade (post-PLAN.md, 2026) — re-anchored a second time, this
+    # pass away from aegiscode-plugin's dark chrome and onto aegisone's
+    # actual web palette (aegis1/templates/aegis-one.html :root). bg/bg2/bg3,
+    # border/border2 and text/text2/text3 are aegisone's --bg/--surface/
+    # --surface2, --border/--border2 and --text/--muted/--muted2 verbatim.
+    # cyan/cyan_dim is aegisone's --accent2 (#0F6E56, its own primary CTA
+    # color) plus a darkened hover shade computed the same way as the old
+    # cyan/cyan_dim pair; purple is aegisone's --accent (#534AB7) — unused
+    # by name elsewhere in this file, kept for parity with aegisone's own
+    # two-accent system rather than left pointing at an unrelated blue.
+    # green/orange/red are deliberately NOT borrowed from aegisone, which
+    # has no severity language of its own (no warn/critical concept) — a
+    # security audit's pass/warn/critical triad has to stay mutually
+    # distinct and legible on a white background, so these are tuned for
+    # that job specifically rather than re-derived from marketing copy.
+    "bg":        "#ffffff",
+    "bg2":       "#f8f8f6",
+    "bg3":       "#f2f2ef",
+    "border":    "#e8e8e4",
+    "border2":   "#d8d8d4",
+    "cyan":      "#0F6E56",
+    "cyan_dim":  "#0d5e49",
+    "purple":    "#534AB7",
+    "text":      "#111110",
+    "text2":     "#6b6b68",
+    "text3":     "#9b9b98",
+    "green":     "#1f8a4c",
+    "red":       "#c0392b",
+    "orange":    "#b36b00",
     "white":     "#ffffff",
 }
 
@@ -807,8 +822,8 @@ def _display_font_stack():
     than erroring, so availability is checked explicitly here instead of
     trusting Qt to degrade sensibly on its own."""
     if HAS_QT and "Syne" in QFontDatabase.families():
-        return "'Syne', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace"
-    return "'JetBrains Mono', 'Fira Mono', 'Courier New', monospace"
+        return "'Syne', 'DM Mono', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace"
+    return "'DM Mono', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace"
 
 
 AUDIT_SECTIONS = [
@@ -5090,7 +5105,7 @@ class SignInDialog(QDialog):
         pill = 20
         self.setStyleSheet(f"""
             QDialog {{ background:{COLORS['bg']}; }}
-            QLabel#glyph  {{ color:{COLORS['text']}; font-size:40px; font-weight:800; }}
+            QLabel#glyph  {{ color:{COLORS['purple']}; font-size:40px; font-weight:800; }}
             QLabel#title  {{ color:{COLORS['text']}; font-size:17px; font-weight:600; }}
             QLabel#sub    {{ color:{COLORS['text2']}; font-size:12px; }}
             QLabel#status {{ color:{COLORS['text2']}; font-size:11px; min-height:14px; }}
@@ -5099,9 +5114,14 @@ class SignInDialog(QDialog):
                            font-size:13px; font-weight:600; padding:11px 16px; }}
             QPushButton#google {{ background:{self.GOOGLE_BLUE}; border-color:{self.GOOGLE_BLUE};
                                   color:#ffffff; }}
+            QPushButton#key {{ border-color:{COLORS['purple']}; color:{COLORS['purple']}; }}
+            QPushButton#key:hover {{ background:{COLORS['purple']}; color:#ffffff; }}
+            QPushButton#verify {{ background:{COLORS['cyan']}; border-color:{COLORS['cyan']};
+                                 color:#ffffff; }}
+            QPushButton#verify:hover {{ background:{COLORS['cyan_dim']}; border-color:{COLORS['cyan_dim']}; }}
             QPushButton#skip {{ background:transparent; border:none; font-weight:normal;
                                 color:{COLORS['text3']}; font-size:11px; padding:4px; }}
-            QPushButton:disabled {{ color:{COLORS['text3']}; }}
+            QPushButton:disabled {{ color:{COLORS['text3']}; border-color:{COLORS['border']}; }}
             QLineEdit {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                          border:1px solid {COLORS['border']}; border-radius:6px;
                          padding:8px; font-size:12px; }}
@@ -5135,6 +5155,7 @@ class SignInDialog(QDialog):
         layout.addWidget(self.btn_google)
 
         self.btn_key = QPushButton("Continue with an AEGIS Cloud key")
+        self.btn_key.setObjectName("key")
         layout.addWidget(self.btn_key)
 
         self.key_input = QLineEdit()
@@ -5143,6 +5164,7 @@ class SignInDialog(QDialog):
         layout.addWidget(self.key_input)
 
         self.btn_verify = QPushButton("Verify")
+        self.btn_verify.setObjectName("verify")
         self.btn_verify.setVisible(False)
         layout.addWidget(self.btn_verify)
 
@@ -5233,15 +5255,15 @@ class RemediationDialog(QDialog):
             QLabel    {{ color:{COLORS['text']}; font-size:12px; }}
             QTextEdit {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                          border:1px solid {COLORS['border']}; border-radius:6px;
-                         font-family:'JetBrains Mono','Fira Mono',monospace;
+                         font-family:'DM Mono','JetBrains Mono','Fira Mono',monospace;
                          font-size:12px; padding:8px; }}
             QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                            border:1px solid {COLORS['border']}; border-radius:14px;
                            padding:7px 18px; font-size:12px; }}
-            QPushButton#apply {{ background:{COLORS['cyan']}; color:#04140f;
+            QPushButton#apply {{ background:{COLORS['cyan']}; color:#ffffff;
                                  font-weight:bold; border:none; }}
             QPushButton:hover  {{ border-color:{COLORS['cyan']}; color:{COLORS['cyan']}; }}
-            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#04140f; }}
+            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#ffffff; }}
             QPushButton:disabled {{ color:{COLORS['text3']}; border-color:{COLORS['bg3']}; }}
         """)
 
@@ -5423,15 +5445,15 @@ class PlanDialog(QDialog):
             QLabel    {{ color:{COLORS['text']}; font-size:12px; }}
             QTextEdit {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                          border:1px solid {COLORS['border']}; border-radius:6px;
-                         font-family:'JetBrains Mono','Fira Mono',monospace;
+                         font-family:'DM Mono','JetBrains Mono','Fira Mono',monospace;
                          font-size:12px; padding:8px; }}
             QPushButton {{ background:{COLORS['bg3']}; color:{COLORS['text']};
                            border:1px solid {COLORS['border']}; border-radius:14px;
                            padding:7px 18px; font-size:12px; }}
-            QPushButton#apply {{ background:{COLORS['cyan']}; color:#04140f;
+            QPushButton#apply {{ background:{COLORS['cyan']}; color:#ffffff;
                                  font-weight:bold; border:none; }}
             QPushButton:hover  {{ border-color:{COLORS['cyan']}; color:{COLORS['cyan']}; }}
-            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#04140f; }}
+            QPushButton#apply:hover {{ background:{COLORS['cyan_dim']}; color:#ffffff; }}
             QPushButton:disabled {{ color:{COLORS['text3']}; border-color:{COLORS['bg3']}; }}
         """)
 
@@ -5552,7 +5574,7 @@ class SecurityAuditWindow(QMainWindow):
             QMainWindow, QWidget {{
                 background-color: {COLORS['bg']};
                 color: {COLORS['text']};
-                font-family: 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace;
+                font-family: 'DM Mono', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace;
                 font-size: 12px;
             }}
             QScrollBar:vertical {{
@@ -5606,13 +5628,13 @@ class SecurityAuditWindow(QMainWindow):
             }}
             QPushButton#btn_run {{
                 background: {COLORS['cyan']};
-                color: #04140f;
+                color: #ffffff;
                 font-weight: bold;
                 border: none;
             }}
             QPushButton#btn_run:hover {{
                 background: {COLORS['cyan_dim']};
-                color: #04140f;
+                color: #ffffff;
             }}
             QTextEdit {{
                 background: {COLORS['bg2']};
@@ -5620,7 +5642,7 @@ class SecurityAuditWindow(QMainWindow):
                 border: 1px solid {COLORS['border']};
                 border-radius: 8px;
                 padding: 10px;
-                font-family: 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace;
+                font-family: 'DM Mono', 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace;
                 font-size: 13px;
                 line-height: 1.5;
             }}
@@ -5961,7 +5983,7 @@ class SecurityAuditWindow(QMainWindow):
             else:
                 html_lines.append(f'<span style="color:{COLORS["text"]}">{line}</span>')
         html = (
-            f'<div style="font-family:\'JetBrains Mono\',\'Fira Mono\',monospace;'
+            f'<div style="font-family:\'DM Mono\',\'JetBrains Mono\',\'Fira Mono\',monospace;'
             f'font-size:13px;line-height:1.7;background:{COLORS["bg2"]};'
             f'color:{COLORS["text"]};padding:4px">'
             + "<br>".join(html_lines)
@@ -6038,10 +6060,10 @@ class SecurityAuditWindow(QMainWindow):
             "error":    COLORS["red"],
         }
         bg_map = {
-            "ok":       "#0a1a0a",
-            "warn":     "#1f1200",
-            "critical": "#1f0000",
-            "error":    "#1f0000",
+            "ok":       "#eaf6ef",
+            "warn":     "#fbf1e0",
+            "critical": "#fbeae8",
+            "error":    "#fbeae8",
         }
         prefix_map = {
             "ok":       "✓ ",
@@ -6131,7 +6153,7 @@ class SecurityAuditWindow(QMainWindow):
 
         if not warnings:
             self.output_view.setHtml(
-                f'<div style="font-family:\'JetBrains Mono\',\'Fira Mono\',monospace;'
+                f'<div style="font-family:\'DM Mono\',\'JetBrains Mono\',\'Fira Mono\',monospace;'
                 f'background:{COLORS["bg2"]};color:{COLORS["text"]};padding:4px">'
                 + score_html
                 + f'<div style="color:{COLORS["green"]};font-size:13px;font-weight:bold">'
@@ -6166,7 +6188,7 @@ class SecurityAuditWindow(QMainWindow):
             )
 
         self.output_view.setHtml(
-            f'<div style="font-family:\'JetBrains Mono\',\'Fira Mono\',monospace;'
+            f'<div style="font-family:\'DM Mono\',\'JetBrains Mono\',\'Fira Mono\',monospace;'
             f'background:{COLORS["bg2"]};color:{COLORS["text"]};padding:4px">'
             + "".join(lines) + "</div>"
         )
