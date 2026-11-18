@@ -835,6 +835,11 @@ COLORS = {
     "cyan":      "#00e5c0",
     "cyan_dim":  "#00b89a",
     "purple":    "#534AB7",
+    # Brand ink for the Rx mark. Gold reads as authority against the black
+    # plate and holds legible weight at 16px, where cyan dissolves into the
+    # chrome it sits on.
+    "gold":      "#d4af37",
+    "gold_dim":  "#8a6d1f",
     "text":      "#d4d4d8",
     "text2":     "#9d9d9d",
     "text3":     "#6e6e6e",
@@ -5409,6 +5414,71 @@ def svg_icon(name, size=14, color=None):
     return QIcon(pixmap)
 
 
+# ── Rx seal ───────────────────────────────────────────────
+# The brand mark: a gold Rx ligature inside a gold ring, on a black plate.
+# Drawn as vector paths rather than set in a typeface so it renders the same
+# on a machine that has never seen the font, and so one definition serves the
+# 16px taskbar, the 30px sidebar lockup and the 256px dock without a raster
+# asset per size. Gold rather than cyan on purpose: at 16px a teal ring
+# dissolves into the chrome it sits on, while gold holds its edge.
+_RX_SEAL_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<circle cx="32" cy="32" r="31" fill="#070708"/>'
+    '<circle cx="32" cy="32" r="28.4" fill="none" '
+    'stroke="#d4af37" stroke-width="3.2"/>'
+    '<circle cx="32" cy="32" r="23.6" fill="none" '
+    'stroke="#8a6d1f" stroke-width="1"/>'
+    '<g fill="none" stroke="#d4af37" stroke-width="3.4" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M17 43V21"/>'
+    '<path d="M17 21h8.5a7 7 0 0 1 0 14H17"/>'
+    '<path d="M25.5 35 34 43"/>'
+    '<path d="M37 33 47 43"/>'
+    '<path d="M47 33 37 43"/>'
+    '</g></svg>'
+)
+
+
+def rx_seal_pixmap(size=64):
+    """The Rx seal at `size` px, or None when Qt is unavailable.
+
+    QPixmap construction does not raise without a live QApplication -- it
+    aborts the process -- so this carries the same guard as
+    _installed_font_families(). A headless test or --audit run must degrade to
+    "no seal", never take the process down."""
+    if QSvgRenderer is None or QPixmap is None:
+        return None
+    try:
+        if QApplication.instance() is None:
+            return None
+    except Exception:
+        return None
+    renderer = QSvgRenderer(QByteArray(_RX_SEAL_SVG.encode()))
+    if not renderer.isValid():
+        return None
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    renderer.render(painter)
+    painter.end()
+    return pixmap
+
+
+def rx_seal_icon():
+    """Window/taskbar icon, rasterised from the one seal definition at every
+    size a desktop actually asks for — a single 64px pixmap is downsampled by
+    the window manager into a smeared ring at 16px."""
+    if QSvgRenderer is None or QIcon is None:
+        return QIcon()
+    icon = QIcon()
+    for size in (16, 22, 24, 32, 48, 64, 128, 256):
+        pixmap = rx_seal_pixmap(size)
+        if pixmap is not None:
+            icon.addPixmap(pixmap)
+    return icon
+
+
 class SignInDialog(QDialog):
 
     """PLAN.md Phase 15 — the sign-in gate, shown once per profile from
@@ -5943,6 +6013,7 @@ class SecurityAuditWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
+        self.setWindowIcon(rx_seal_icon())
         self.resize(1200, 800)
         self.results  = {}
         self.worker   = None
@@ -6103,9 +6174,24 @@ class SecurityAuditWindow(QMainWindow):
         sb.setContentsMargins(12, 16, 12, 12)
         sb.setSpacing(8)
 
+        # Sidebar lockup: seal + wordmark on one baseline. The seal is a pixmap
+        # sized to the cap height rather than an image in the stylesheet, so it
+        # cannot be scaled off its aspect ratio by a DPI change.
+        brand_row = QHBoxLayout()
+        brand_row.setContentsMargins(0, 0, 0, 0)
+        brand_row.setSpacing(8)
+        seal = rx_seal_pixmap(30)
+        if seal is not None:
+            lbl_seal = QLabel()
+            lbl_seal.setObjectName("seal")
+            lbl_seal.setPixmap(seal)
+            lbl_seal.setFixedSize(30, 30)
+            brand_row.addWidget(lbl_seal)
         lbl_title = QLabel("ÆGIS")
         lbl_title.setObjectName("title")
-        sb.addWidget(lbl_title)
+        brand_row.addWidget(lbl_title)
+        brand_row.addStretch()
+        sb.addLayout(brand_row)
 
         lbl_sub = QLabel(f"Security Audit  v{VERSION}  [{_OS}]")
         lbl_sub.setObjectName("subtitle")
@@ -6831,6 +6917,9 @@ def main(argv=None):
         app.setFont(_af)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)
+    # App-level icon so dialogs and the taskbar inherit the seal without every
+    # window setting it individually.
+    app.setWindowIcon(rx_seal_icon())
     cfg = _load_config()
     if not cfg.get("_onboarding_seen") and not cfg.get("aegis_api_key"):
         SignInDialog().exec()

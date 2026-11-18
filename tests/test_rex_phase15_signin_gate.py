@@ -67,6 +67,12 @@ class _FakeApp:
     def setApplicationVersion(self, *a):
         pass
 
+    # main() sets the app-wide window icon so dialogs and the taskbar inherit
+    # the Rx seal. Same rule as font()/setFont() below: a stand-in QApplication
+    # that cannot answer every call main() makes is not a faithful double.
+    def setWindowIcon(self, *a):
+        pass
+
     # main() sets the app-wide font so dialogs inherit Ubuntu instead of Qt's
     # generic default. A stand-in QApplication must answer font()/setFont() or
     # it is not a faithful double.
