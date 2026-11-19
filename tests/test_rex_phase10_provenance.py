@@ -128,13 +128,15 @@ def test_no_destructive_filesystem_verbs_anywhere_in_rex():
 # "these verbs are absent" and actually enforcing "no finding may drive a write".
 _REVIEWED_WRITE_SITES = {
     # pattern: (expected count, every legitimate site)
-    r'open\([^)]*,\s*["\'][wa]': (4, "_save_config; --output; GUI export; "
-                                     "_fetch_extra_signatures feed cache (Phase 7)"),
+    r'open\([^)]*,\s*["\'][wa]': (5, "_save_config; --output; GUI export; "
+                                     "_fetch_extra_signatures feed cache (Phase 7); "
+                                     "_fetch_network_iocs feed cache (Phase 20)"),
     r"os\.chmod\(": (3, "_save_config; --output; GUI export"),
-    # PLAN.md Phase 7: the feed-cache write is to a cache directory this
-    # process owns, never to an audited/scanned path, and is not keyed on
-    # any finding — it is the one place os.replace() is allowed to exist.
-    r"os\.replace\(": (1, "_fetch_extra_signatures feed cache (Phase 7)"),
+    # PLAN.md Phase 7/20: both feed-cache writes are to a cache directory this
+    # process owns, never to an audited/scanned path, and are not keyed on
+    # any finding — the only two places os.replace() is allowed to exist.
+    r"os\.replace\(": (2, "_fetch_extra_signatures feed cache (Phase 7); "
+                          "_fetch_network_iocs feed cache (Phase 20)"),
 }
 
 

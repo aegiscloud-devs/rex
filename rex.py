@@ -1013,6 +1013,125 @@ def _fetch_extra_signatures(cache_dir=None, *, timeout=10):
     except Exception:  # noqa: BLE001
         return None, "unavailable"
 
+
+# PLAN.md Phase 20 — curated campaign IOCs (currently ARTEX/BLOODALCHEMY),
+# checked against live network connections during a scan. Same cadence and
+# fail-open contract as the hash feed above: a scheduled `rex --audit` must
+# not beacon on every run, and a fetch failure must degrade quietly to "no
+# IOC check this run", never fail the scan.
+NETWORK_IOC_ENDPOINT = "https://aegiscloud.org/api/rex/network-iocs.json"
+NETWORK_IOC_CACHE_MAX_AGE = 24 * 60 * 60
+
+
+def _fetch_network_iocs(cache_dir=None, *, timeout=10):
+    """Fetch and cache the campaign network-IOC list at
+    <cache_dir>/network-iocs.json. Returns (entries, status) where entries
+    is a list of {"type", "value", "campaign", "note"} dicts (empty list on
+    any failure) and status is "fresh" / "refetched" / "unavailable", same
+    vocabulary as _fetch_extra_signatures.
+
+    Never raises: a malformed cache file or a network error must not fail
+    the Network section — it already has DNS-posture findings to report
+    with or without this."""
+    cache_dir = cache_dir or _feed_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "network-iocs.json")
+
+    body = None
+    status = "unavailable"
+    try:
+        age = time.time() - os.path.getmtime(path)
+        if age < NETWORK_IOC_CACHE_MAX_AGE:
+            with open(path, encoding="utf-8") as fh:
+                body = fh.read()
+            status = "fresh"
+    except OSError:
+        pass  # no cache yet — fall through to fetch
+
+    if body is None:
+        try:
+            with urllib.request.urlopen(NETWORK_IOC_ENDPOINT, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.replace(tmp, path)
+            status = "refetched"
+        except Exception:  # noqa: BLE001
+            return [], "unavailable"
+
+    try:
+        return json.loads(body).get("entries", []), status
+    except Exception:  # noqa: BLE001
+        return [], status
+
+
+def _network_ioc_alerts(entries):
+    """Cross-check live connections' remote IPs against the campaign IOC
+    list. IP-only: rex has no per-connection DNS resolution to check a
+    "domain" entry against, so those exist for a human reading the report,
+    not for this function. Report-only, like every other audit section —
+    there is no remediation code path anywhere in this file to wire it
+    into."""
+    ip_entries = {e["value"]: e for e in entries if e.get("type") == "ip" and e.get("value")}
+    if not ip_entries or psutil is None:
+        return []
+    alerts = []
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except Exception:  # noqa: BLE001, S110
+        return []
+    for c in conns:
+        if not c.raddr:
+            continue
+        hit = ip_entries.get(c.raddr.ip)
+        if hit:
+            label = f"{hit['campaign']} — {hit['note']}" if hit.get("note") else hit["campaign"]
+            alerts.append(f"{c.raddr.ip}:{c.raddr.port}  ({label})")
+    return alerts
+
+
+# PLAN.md Phase 20 — process-lineage markers from public ARTEX/BLOODALCHEMY
+# reporting (CERT-EU, SOCPrime, Nov 2026): the framework's own probe
+# binaries/accounts are named distinctively, and its webshells/PHP2Shell
+# path get a shell by having a web-server process spawn one directly —
+# something a normal install essentially never does on its own. Report-only
+# like every AUDIT_SECTIONS check: there is no remediation code path in this
+# file for any of them to join.
+ARTEX_NAME_MARKERS = ("artex-probe", "artexprobe", "artx5v", "scopeweaver", "reconprobe")
+WEB_SERVER_PROCESS_NAMES = (
+    "apache2", "httpd", "nginx", "php-fpm", "php-fpm7", "php-fpm8", "java", "tomcat", "tomcat9",
+)
+SHELL_PROCESS_NAMES = (
+    "sh", "bash", "dash", "zsh", "cmd.exe", "powershell", "powershell.exe",
+    "nc", "ncat", "netcat", "nmap", "curl", "wget",
+)
+
+
+def _artex_process_alerts(info_by_pid):
+    """Flag (never act on) processes matching known ARTEX artifact names, or
+    a shell/recon tool whose direct parent is a web-server process — the
+    PHP2Shell lineage pattern the Nov 2026 advisories call out. A false
+    positive here is a dev box running `nginx -g 'daemon off;'` under a
+    supervisor that itself looks shell-like; that is an acceptable cost for
+    a report-only heuristic with no remediation action behind it."""
+    alerts = []
+    for pid, info in info_by_pid.items():
+        name = (info.get("name") or "").lower()
+        if any(marker in name for marker in ARTEX_NAME_MARKERS):
+            alerts.append(f"pid {pid} ({info.get('name')}) matches a known ARTEX artifact name")
+            continue
+        if name in SHELL_PROCESS_NAMES:
+            parent = info_by_pid.get(info.get("ppid"))
+            parent_name = (parent.get("name") or "").lower() if parent else ""
+            if parent_name in WEB_SERVER_PROCESS_NAMES:
+                alerts.append(
+                    f"pid {pid} ({info.get('name')}) spawned by web-server process "
+                    f"{parent.get('name')} (pid {info.get('ppid')}) — matches ARTEX/webshell lineage"
+                )
+    return alerts
+
+
 # Sections that cannot be assessed at all without psutil — keep in sync with
 # the `if psutil is None` guards in _run_section.
 PSUTIL_GATED_SECTIONS = ("CPU & Memory", "Disk", "Network", "Running Processes")
@@ -1712,6 +1831,15 @@ class AuditEngine:
             status = "ok"
             if posture.get("available") and not posture.get("secure"):
                 status = "warn"
+
+            ioc_entries, _ioc_feed_status = _fetch_network_iocs()
+            ioc_alerts = _network_ioc_alerts(ioc_entries)
+            if ioc_alerts:
+                status = "warn"
+                out.append("")
+                out.append("Active connections matching known attack-campaign IOCs:")
+                out.extend(f"  {a}" for a in ioc_alerts)
+
             return status, "\n".join(out) or "No network interfaces"
 
         # ── Open Ports ────────────────────────────────────────
@@ -1756,15 +1884,23 @@ class AuditEngine:
                 # Absence of evidence, not a finding: the check never ran.
                 return "error", PSUTIL_MISSING
             procs = []
-            for p in psutil.process_iter(["pid", "name", "username", "cpu_percent"]):
+            info_by_pid = {}
+            for p in psutil.process_iter(["pid", "name", "username", "cpu_percent", "ppid"]):
                 try:
+                    info_by_pid[p.info["pid"]] = p.info
                     procs.append(
                         f"{p.info['pid']:>6}  {p.info['username'] or ''!s:<15}  {p.info['name']}"
                     )
                 except Exception:  # noqa: BLE001, S110
                     pass
             suffix = "\n[truncated...]" if len(procs) > 60 else ""
-            return "ok", "\n".join(procs[:60]) + suffix
+
+            alerts = _artex_process_alerts(info_by_pid)
+            status = "warn" if alerts else "ok"
+            body = "\n".join(procs[:60]) + suffix
+            if alerts:
+                body += "\n\nPossible ARTEX/webshell activity:\n  " + "\n  ".join(alerts)
+            return status, body
 
         # ── Startup Services ──────────────────────────────────
         elif section == "Startup Services":
