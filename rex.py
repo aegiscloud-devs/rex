@@ -255,7 +255,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.13"
+VERSION  = "1.9.14"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -1079,7 +1079,7 @@ def _network_ioc_alerts(entries):
     alerts = []
     try:
         conns = psutil.net_connections(kind="inet")
-    except Exception:  # noqa: BLE001, S110
+    except Exception:  # noqa: BLE001
         return []
     for c in conns:
         if not c.raddr:
