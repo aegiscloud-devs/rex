@@ -255,7 +255,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.14"
+VERSION  = "1.9.15"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
