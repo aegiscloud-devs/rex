@@ -2912,9 +2912,53 @@ class AuditEngine:
                         except Exception:  # noqa: BLE001
                             pass
                     self._scan_proc = None
-                    return "info", (f"Cancelled — stopped after {files_scanned} "
-                                    f"file(s).\nPartial results are not a clean "
-                                    f"bill of health: re-run to completion.")
+
+                    # A stop used to discard every FOUND line collected before
+                    # it, reporting only a file count. Three infected files and
+                    # then Stop read as "Cancelled — stopped after N files",
+                    # which is indistinguishable from a stop on a clean tree.
+                    # Whatever was already found is a fact regardless of the
+                    # walk not finishing, so keep it and say so.
+                    #
+                    # No join on feed_thread: the feed overlay runs through
+                    # _cmd, which holds no process handle and cannot be
+                    # terminated (see stop()). Blocking here would stall Stop
+                    # for up to that call's own 600s timeout, which is exactly
+                    # the unresponsiveness stop() was fixed to avoid. Take
+                    # whatever it has produced so far and label it.
+                    if feed_thread.is_alive():
+                        feed_status = "interrupted"
+                    tagged_partial = (
+                        [f"[{SIGNATURE_SOURCE_LOCAL}] {t}" for t in list(threats)]
+                        + [f"[{SIGNATURE_SOURCE_FEED}] {t}"
+                           for t in list(feed_threats)]
+                    )
+                    partial_note = (
+                        f"Stopped — {files_scanned} file(s) scanned before the "
+                        f"stop.\n"
+                        "Unscanned files were NOT assessed, so this is not a "
+                        "clean bill of health: re-run to completion.\n"
+                        # Machine-readable marker, same convention as
+                        # [feed_status:...]. The GUI cannot key on the opening
+                        # word: a partial run that DID find something opens with
+                        # the threat banner, not with "Stopped".
+                        "[scan_status:stopped]"
+                    )
+                    if tagged_partial:
+                        # Not "info": a threat observed before the stop is
+                        # still a finding, and "info" appears in no --fail-on
+                        # threshold (see the exit-code map in main()), so a
+                        # stopped scan that had already found malware would
+                        # exit clean under --fail-on warn. The partial caveat
+                        # qualifies what was NOT assessed, not what was.
+                        return "critical", (
+                            f"⚠  {len(tagged_partial)} THREAT(S) FOUND "
+                            f"(partial scan)\n\n"
+                            + "\n".join(tagged_partial)
+                            + f"\n\n{partial_note}\n[feed_status:{feed_status}]"
+                        )
+                    return "info", (partial_note
+                                     + f"\n[feed_status:{feed_status}]")
 
                 proc.wait()
                 self._scan_proc = None
@@ -4405,15 +4449,28 @@ def section_id(section: str) -> str:
 
 def audit_score(results: dict) -> dict:
     """Same formula the GUI's summary panel uses, so the CLI and the window
-    never disagree about whether a host passed."""
+    never disagree about whether a host passed.
+
+    A section that was stopped midway contributes its findings (if any) but
+    also marks the whole run partial. The arithmetic stays honest — nothing was
+    found, so the score is genuinely 100 — but the *grade* cannot be GOOD when
+    part of a section was never scanned: that is the same absence-of-evidence-
+    is-not-a-pass rule the GUI's stopped branch already applies.
+    """
     warnings = [(s, st) for s, (st, _out) in results.items()
                 if st in FIXABLE_STATUSES]
     warn_count = sum(1 for _, st in warnings if st == "warn")
     crit_count = sum(1 for _, st in warnings if st in ("critical", "error"))
     score = max(0, 100 - warn_count * 5 - crit_count * 15)
-    grade = "GOOD" if score >= 80 else "FAIR" if score >= 50 else "POOR"
+    partial = [s for s, (_st, out) in results.items()
+               if isinstance(out, str) and "[scan_status:stopped]" in out]
+    if partial:
+        grade = "INCOMPLETE"
+    else:
+        grade = "GOOD" if score >= 80 else "FAIR" if score >= 50 else "POOR"
     return {"score": score, "grade": grade,
-            "warnings": warn_count, "critical": crit_count}
+            "warnings": warn_count, "critical": crit_count,
+            "partial_sections": partial}
 
 
 def build_report(results: dict, scan_path: str | None = None, include_output: bool = True,
@@ -4500,6 +4557,7 @@ def build_report(results: dict, scan_path: str | None = None, include_output: bo
             "fixable":           sum(1 for f in findings if f["fixable"]),
             "not_applicable":    sum(1 for f in findings if not f["applicable"]),
             "unassessed":        sum(1 for f in findings if f["status"] == "error"),
+            "partial":           len(score["partial_sections"]),
             **score,
         },
         "redacted_sections": list(REDACTED_SECTIONS) if redact else [],
@@ -6677,12 +6735,16 @@ class SecurityAuditWindow(QMainWindow):
             "warn":     COLORS["orange"],
             "critical": COLORS["red"],
             "error":    COLORS["red"],
+            # Neutral, not green: "info" means nothing was assessed (readiness
+            # notes and stopped runs), so it must not borrow the pass colour.
+            "info":     COLORS["text2"],
         }
         labels = {
             "ok":       "✓ OK",
             "warn":     "⚠  WARNING",
             "critical": "✖ CRITICAL",
             "error":    "✖ ERROR",
+            "info":     "ℹ  INFO",
         }
         c = colors.get(status, COLORS["text2"])
         label = labels.get(status, status.upper())
@@ -6759,8 +6821,13 @@ class SecurityAuditWindow(QMainWindow):
         self.scan_meter.finish()
         self.btn_run_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
-        if status == "info" and output.startswith("Cancelled"):
-            self.lbl_section_status.setText("Cancelled")
+        # A stopped scan may come back "critical" (threats already found) or
+        # "info" (nothing found yet), and the critical case opens with the
+        # threat banner rather than the word "Stopped" — so key on the
+        # machine marker (with the legacy prefix kept for older output).
+        if ("[scan_status:stopped]" in output
+                or output.startswith(("Stopped —", "Cancelled —"))):
+            self.lbl_section_status.setText("Stopped")
         self._show_output(status, output)
         self.btn_ai_fix.setEnabled(status in ("warn", "critical", "error"))
 
