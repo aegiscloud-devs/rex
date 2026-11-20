@@ -255,7 +255,7 @@ def plat_report():
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.9.14"
+VERSION  = "1.9.15"
 APP_NAME = "ÆGIS Security Audit"
 
 # Lines emitted by find(1)/stat(1) *about* a path rather than *as a result*.
@@ -1602,6 +1602,9 @@ class AuditEngine:
             scan_path = os.path.expanduser("~")
         self.scan_path = os.path.realpath(scan_path)
         self._stop = False
+        # Sections that finished, kept so a stopped or interrupted run can
+        # report what was actually assessed instead of discarding it.
+        self.partial_results = {}
         # ClamAV progress hook. The GUI bridges this to its Qt signal; headless
         # callers pass their own callback (or nothing).
         self._on_progress = lambda label, count: None
@@ -1624,6 +1627,10 @@ class AuditEngine:
         # checks _stop before starting, so a cancelled scan never spawns a
         # second ClamAV walk that would outlive the stop.
 
+    def _record(self, section, result):
+        self.partial_results[section] = result
+        return result
+
     def _run_safe(self, section):
         try:
             return self._run_section(section)
@@ -1639,6 +1646,7 @@ class AuditEngine:
             if self._stop:
                 break
             out[section] = self._run_safe(section)
+            self._record(section, out[section])
         return out
 
     def collect_parallel(self, sections=None, workers=8):
@@ -1648,11 +1656,29 @@ class AuditEngine:
         with ThreadPoolExecutor(max_workers=min(workers, max(1, len(todo)))) as ex:
             futures = {ex.submit(self._run_safe, s): s for s in todo if not self._stop}
             for future in as_completed(futures):
+                if self._stop:
+                    # Same reason as AuditWorker.run(): without this the loop
+                    # drains every submitted future, so a stop requested from
+                    # another thread (or a SIGINT) only takes effect after the
+                    # slowest section finishes — which is not a stop.
+                    #
+                    # Do not simply abandon the rest: a future that already
+                    # completed did assess its section, and dropping it would
+                    # under-report a run that actually has the evidence. Only
+                    # genuinely unfinished work is left unassessed.
+                    for pending, name in futures.items():
+                        if pending.done() and not pending.cancelled():
+                            try:
+                                self._record(name, pending.result())
+                            except Exception:  # noqa: BLE001
+                                pass
+                    break
                 section = futures[future]
                 try:
                     out[section] = future.result()
                 except Exception as e:  # noqa: BLE001
                     out[section] = ("error", str(e))
+                self._record(section, out[section])
         return out
 
     # ── helpers ──────────────────────────────────────────────
@@ -2886,9 +2912,53 @@ class AuditEngine:
                         except Exception:  # noqa: BLE001
                             pass
                     self._scan_proc = None
-                    return "info", (f"Cancelled — stopped after {files_scanned} "
-                                    f"file(s).\nPartial results are not a clean "
-                                    f"bill of health: re-run to completion.")
+
+                    # A stop used to discard every FOUND line collected before
+                    # it, reporting only a file count. Three infected files and
+                    # then Stop read as "Cancelled — stopped after N files",
+                    # which is indistinguishable from a stop on a clean tree.
+                    # Whatever was already found is a fact regardless of the
+                    # walk not finishing, so keep it and say so.
+                    #
+                    # No join on feed_thread: the feed overlay runs through
+                    # _cmd, which holds no process handle and cannot be
+                    # terminated (see stop()). Blocking here would stall Stop
+                    # for up to that call's own 600s timeout, which is exactly
+                    # the unresponsiveness stop() was fixed to avoid. Take
+                    # whatever it has produced so far and label it.
+                    if feed_thread.is_alive():
+                        feed_status = "interrupted"
+                    tagged_partial = (
+                        [f"[{SIGNATURE_SOURCE_LOCAL}] {t}" for t in list(threats)]
+                        + [f"[{SIGNATURE_SOURCE_FEED}] {t}"
+                           for t in list(feed_threats)]
+                    )
+                    partial_note = (
+                        f"Stopped — {files_scanned} file(s) scanned before the "
+                        f"stop.\n"
+                        "Unscanned files were NOT assessed, so this is not a "
+                        "clean bill of health: re-run to completion.\n"
+                        # Machine-readable marker, same convention as
+                        # [feed_status:...]. The GUI cannot key on the opening
+                        # word: a partial run that DID find something opens with
+                        # the threat banner, not with "Stopped".
+                        "[scan_status:stopped]"
+                    )
+                    if tagged_partial:
+                        # Not "info": a threat observed before the stop is
+                        # still a finding, and "info" appears in no --fail-on
+                        # threshold (see the exit-code map in main()), so a
+                        # stopped scan that had already found malware would
+                        # exit clean under --fail-on warn. The partial caveat
+                        # qualifies what was NOT assessed, not what was.
+                        return "critical", (
+                            f"⚠  {len(tagged_partial)} THREAT(S) FOUND "
+                            f"(partial scan)\n\n"
+                            + "\n".join(tagged_partial)
+                            + f"\n\n{partial_note}\n[feed_status:{feed_status}]"
+                        )
+                    return "info", (partial_note
+                                     + f"\n[feed_status:{feed_status}]")
 
                 proc.wait()
                 self._scan_proc = None
@@ -3029,7 +3099,9 @@ class AuditWorker(QThread, AuditEngine):
 
     section_done  = pyqtSignal(str, str, str)
     scan_progress = pyqtSignal(str, int)
-    all_done      = pyqtSignal()
+    # True when the run ended because stop() was called: some sections never
+    # ran, so the caller must report a partial result instead of a clean host.
+    all_done      = pyqtSignal(bool)
 
     def __init__(self, sections, scan_path=None):
         QThread.__init__(self)
@@ -3051,7 +3123,8 @@ class AuditWorker(QThread, AuditEngine):
                 except Exception as e:  # noqa: BLE001
                     status, output = "error", str(e)
                 self.section_done.emit(section, status, output)
-        self.all_done.emit()
+                self._record(section, (status, output))
+        self.all_done.emit(self._stop)
 
 
 
@@ -4376,15 +4449,28 @@ def section_id(section: str) -> str:
 
 def audit_score(results: dict) -> dict:
     """Same formula the GUI's summary panel uses, so the CLI and the window
-    never disagree about whether a host passed."""
+    never disagree about whether a host passed.
+
+    A section that was stopped midway contributes its findings (if any) but
+    also marks the whole run partial. The arithmetic stays honest — nothing was
+    found, so the score is genuinely 100 — but the *grade* cannot be GOOD when
+    part of a section was never scanned: that is the same absence-of-evidence-
+    is-not-a-pass rule the GUI's stopped branch already applies.
+    """
     warnings = [(s, st) for s, (st, _out) in results.items()
                 if st in FIXABLE_STATUSES]
     warn_count = sum(1 for _, st in warnings if st == "warn")
     crit_count = sum(1 for _, st in warnings if st in ("critical", "error"))
     score = max(0, 100 - warn_count * 5 - crit_count * 15)
-    grade = "GOOD" if score >= 80 else "FAIR" if score >= 50 else "POOR"
+    partial = [s for s, (_st, out) in results.items()
+               if isinstance(out, str) and "[scan_status:stopped]" in out]
+    if partial:
+        grade = "INCOMPLETE"
+    else:
+        grade = "GOOD" if score >= 80 else "FAIR" if score >= 50 else "POOR"
     return {"score": score, "grade": grade,
-            "warnings": warn_count, "critical": crit_count}
+            "warnings": warn_count, "critical": crit_count,
+            "partial_sections": partial}
 
 
 def build_report(results: dict, scan_path: str | None = None, include_output: bool = True,
@@ -4471,6 +4557,7 @@ def build_report(results: dict, scan_path: str | None = None, include_output: bo
             "fixable":           sum(1 for f in findings if f["fixable"]),
             "not_applicable":    sum(1 for f in findings if not f["applicable"]),
             "unassessed":        sum(1 for f in findings if f["status"] == "error"),
+            "partial":           len(score["partial_sections"]),
             **score,
         },
         "redacted_sections": list(REDACTED_SECTIONS) if redact else [],
@@ -5185,10 +5272,31 @@ def _cli_main(argv) -> int:
     results = None
     if args.audit:
         engine = AuditEngine(sections, scan_path=scan_path)
-        if args.sequential:
-            results = engine.collect(progress=None)
-        else:
-            results = engine.collect_parallel()
+        try:
+            if args.sequential:
+                results = engine.collect(progress=None)
+            else:
+                results = engine.collect_parallel()
+        except KeyboardInterrupt:
+            # Ctrl-C during an audit used to bubble to main(), print
+            # "interrupted" and exit 2 — throwing away every section that had
+            # already finished. Report the partial result instead, and say
+            # plainly that the sections which never ran were not assessed.
+            results = getattr(engine, "partial_results", None) or {}
+            ran = len(results)
+            expected_n = len(sections)
+            print(f"\ninterrupted — {ran}/{expected_n} sections ran",
+                  file=sys.stderr)
+            partial = build_report(
+                results, scan_path=scan_path or os.path.expanduser("~"))
+            for f in partial.get("findings", []):
+                if f.get("status") == "ok":
+                    continue
+                label = f["severity"] if f["fixable"] else f["status"]
+                print(f"  {label:<8} {f['id']:<28} {f['section']}")
+            print(f"  {expected_n - ran} section(s) not run — not assessed, "
+                  f"not passed", file=sys.stderr)
+            return EXIT_USAGE
         report = build_report(results,
                               scan_path=scan_path or os.path.expanduser("~"))
 
@@ -6627,12 +6735,16 @@ class SecurityAuditWindow(QMainWindow):
             "warn":     COLORS["orange"],
             "critical": COLORS["red"],
             "error":    COLORS["red"],
+            # Neutral, not green: "info" means nothing was assessed (readiness
+            # notes and stopped runs), so it must not borrow the pass colour.
+            "info":     COLORS["text2"],
         }
         labels = {
             "ok":       "✓ OK",
             "warn":     "⚠  WARNING",
             "critical": "✖ CRITICAL",
             "error":    "✖ ERROR",
+            "info":     "ℹ  INFO",
         }
         c = colors.get(status, COLORS["text2"])
         label = labels.get(status, status.upper())
@@ -6709,8 +6821,13 @@ class SecurityAuditWindow(QMainWindow):
         self.scan_meter.finish()
         self.btn_run_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
-        if status == "info" and output.startswith("Cancelled"):
-            self.lbl_section_status.setText("Cancelled")
+        # A stopped scan may come back "critical" (threats already found) or
+        # "info" (nothing found yet), and the critical case opens with the
+        # threat banner rather than the word "Stopped" — so key on the
+        # machine marker (with the legacy prefix kept for older output).
+        if ("[scan_status:stopped]" in output
+                or output.startswith(("Stopped —", "Cancelled —"))):
+            self.lbl_section_status.setText("Stopped")
         self._show_output(status, output)
         self.btn_ai_fix.setEnabled(status in ("warn", "critical", "error"))
 
@@ -6718,7 +6835,9 @@ class SecurityAuditWindow(QMainWindow):
         if self.worker:
             self.worker.stop()
         self.btn_stop.setEnabled(False)
-        self.lbl_status.setText("Stopped")
+        # Not a verdict: the sections still running have not produced anything,
+        # and _on_all_done will render the partial result a moment from now.
+        self.lbl_status.setText("Stopping…")
 
     def _on_section_done(self, section, status, output):
         self.results[section] = (status, output)
@@ -6774,12 +6893,26 @@ class SecurityAuditWindow(QMainWindow):
             sb = self.output_view.verticalScrollBar()
             sb.setValue(sb.maximum())
 
-    def _on_all_done(self):
+    def _on_all_done(self, stopped=False):
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_export.setEnabled(True)
+        ran = len(self.results)
+        expected = len(AUDIT_SECTIONS)
         warnings = [(s, st, out) for s, (st, out) in self.results.items()
                     if st in ("warn", "critical", "error")]
+        if stopped:
+            # A stopped audit is not a clean host. Reporting "no issues found"
+            # here was the bug: the sections that never ran were counted as
+            # passes, so stopping after three sections scored 100/GOOD.
+            self.lbl_status.setText(
+                f"Stopped — {ran}/{expected} sections ran, "
+                f"{len(warnings)} issue(s) so far")
+            self.lbl_status.setStyleSheet(f"color:{COLORS['orange']};font-size:10px;")
+            self.btn_ai_fix.setEnabled(bool(warnings))
+            self.btn_fix_all.setEnabled(bool(warnings))
+            self._show_summary(warnings, stopped=True, ran=ran, expected=expected)
+            return
         if warnings:
             self.lbl_status.setText(f"Done — {len(warnings)} warning(s)")
             self.lbl_status.setStyleSheet(f"color:{COLORS['orange']};font-size:10px;")
@@ -6791,7 +6924,7 @@ class SecurityAuditWindow(QMainWindow):
             self.lbl_status.setStyleSheet(f"color:{COLORS['green']};font-size:10px;")
             self._show_summary([])
 
-    def _show_summary(self, warnings):
+    def _show_summary(self, warnings, stopped=False, ran=None, expected=None):
         self.lbl_section.setText("Audit Summary")
         self.lbl_section_status.setText("")
         self.scan_toolbar.setVisible(False)
@@ -6803,7 +6936,15 @@ class SecurityAuditWindow(QMainWindow):
         score = max(0, 100 - warn_count * 5 - critical_count * 15)
         bar_filled = round(score / 5)   # 20-block bar, each block = 5 pts
         bar = "█" * bar_filled + "░" * (20 - bar_filled)
-        if score >= 80:
+        if stopped:
+            # Absence of evidence is not a pass: a stopped run has not assessed
+            # the sections it never reached, so it cannot earn a grade.
+            score_color = COLORS["orange"]
+            grade = "INCOMPLETE"
+            clean_span = (f'/ 100 &nbsp;·&nbsp; {max(0, (ran or 0) - len(warnings))}'
+                          f'/{ran or 0} sections clean &nbsp;·&nbsp; '
+                          f'{max(0, (expected or total) - (ran or 0))} not run')
+        elif score >= 80:
             score_color = COLORS["green"]
             grade = "GOOD"
         elif score >= 50:
@@ -6812,6 +6953,8 @@ class SecurityAuditWindow(QMainWindow):
         else:
             score_color = COLORS["red"]
             grade = "POOR"
+        if not stopped:
+            clean_span = (f'/ 100 &nbsp;·&nbsp; {total - len(warnings)}/{total} sections clean')
 
         score_html = (
             f'<div style="margin-bottom:16px;padding:12px 14px;'
@@ -6823,7 +6966,7 @@ class SecurityAuditWindow(QMainWindow):
             f'<span style="color:{score_color};font-size:28px;font-weight:bold">{score}</span>'
             f'<span style="color:{score_color};font-size:12px;font-weight:bold">{grade}</span>'
             f'<span style="color:{COLORS["text2"]};font-size:11px">'
-            f'/ 100 &nbsp;·&nbsp; {total - len(warnings)}/{total} sections clean</span>'
+            f'{clean_span}'
             f'</div>'
             f'<div style="color:{score_color};font-size:13px;letter-spacing:1px;margin-top:6px">'
             f'{bar}</div>'
@@ -6831,12 +6974,18 @@ class SecurityAuditWindow(QMainWindow):
         )
 
         if not warnings:
+            verdict = (f'⚠ Stopped before all sections ran — '
+                       f'{max(0, (expected or total) - (ran or 0))} section(s) '
+                       f'were not assessed, which is not the same as clean.'
+                       if stopped else
+                       '✓ All sections clean')
+            verdict_color = COLORS["orange"] if stopped else COLORS["green"]
             self.output_view.setHtml(
                 f'<div style="font-family:{_mono_font_stack()};'
                 f'background:{COLORS["bg2"]};color:{COLORS["text"]};padding:4px">'
                 + score_html
-                + f'<div style="color:{COLORS["green"]};font-size:13px;font-weight:bold">'
-                  f'✓ All sections clean</div></div>'
+                + f'<div style="color:{verdict_color};font-size:13px;font-weight:bold">'
+                  f'{verdict}</div></div>'
             )
             return
 
